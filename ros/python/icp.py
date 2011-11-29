@@ -5,23 +5,10 @@ import copy
 import math
 import numpy as np
 import scipy as sp
-import matplotlib.pyplot as plt 
-
-import roslib; roslib.load_manifest('scripting_util');
-import rospy
-import tf
-import PyKDL as kdl
-import cv
-
-import std_msgs.msg as std_msgs
-import sensor_msgs.msg as sensor_msgs
-import geometry_msgs.msg as geometry_msgs
 
 import RosUtil as ru
 import Transform as tr
 import PointCloudUtil as pcu
-
-import ObjectModel as om
 
 np.set_printoptions(suppress=True)
 np.set_printoptions(precision=3)
