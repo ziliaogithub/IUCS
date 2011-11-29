@@ -8,19 +8,16 @@ import string
 import numpy as np
 import scipy as sp
 
-import roslib; roslib.load_manifest('scripting_util')
+import roslib; roslib.load_manifest('ros_python_util')
 import rospy
 import tf
 import cv
 import cv_bridge
 import image_geometry
-import PyKDL as kdl
 
 import std_msgs.msg as std_msgs
 import geometry_msgs.msg as geometry_msgs
 import sensor_msgs.msg as sensor_msgs
-
-import Perception_msgs_upenn.msg as Perception_msgs 
 
 import Transform as tr
 import RosUtil as ru

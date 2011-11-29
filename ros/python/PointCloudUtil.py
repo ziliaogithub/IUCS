@@ -8,7 +8,7 @@ import random
 import numpy as np
 import scipy as sp
 
-import roslib; roslib.load_manifest('scripting_util')
+import roslib; roslib.load_manifest('ros_python_util')
 import rospy
 
 import std_msgs.msg as std_msgs
