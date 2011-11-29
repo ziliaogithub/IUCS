@@ -29,36 +29,6 @@ import RosUtil as ru
 rospy.logdebug(__name__ + ': setting up publishers...');
 chessboardDetectionPub = rospy.Publisher('/chessboard_detection', sensor_msgs.Image);
 
-LOAD_CALIB = False;
-
-## load calibration
-pathToCalibration = rospy.get_param('/calibration_location', '/home/arm_user/test/sensor_calib');
-
-if LOAD_CALIB:
-  # append / to path if needed
-  if pathToCalibration[-1] != '/':
-    pathToCalibration += '/';
-
-  rospy.loginfo(__name__ + ': loading sensor calibration from: %s' % pathToCalibration);
-  try:
-    bbExtrinsicRotation = cv.Load(pathToCalibration + 'bbExtrinsicRotation.xml');
-    bbExtrinsicTranslation = cv.Load(pathToCalibration + 'bbExtrinsicTranslation.xml');
-    bbLeftDistCoeffs = cv.Load(pathToCalibration + 'bbLeftDistCoeffs.xml');
-    bbLeftIntrinsics = cv.Load(pathToCalibration + 'bbLeftIntrinsics.xml');
-    bbLeftWrtArm = cv.Load(pathToCalibration + 'bbLeftWrtArm.xml');
-    bbRightDistCoeffs = cv.Load(pathToCalibration + 'bbRightDistCoeffs.xml');
-    bbRightIntrinsics = cv.Load(pathToCalibration + 'bbRightIntrinsics.xml');
-    lowerTilt = cv.Load(pathToCalibration + 'lowerTilt.xml');
-    #prosilicaDistCoeffs = cv.Load(pathToCalibration + 'prosilicaDistCoeffs.xml');
-    #prosilicaIntrinsics = cv.Load(pathToCalibration + 'prosilicaIntrinsics.xml');
-    #proWrtBBExtrinsicRotation = cv.Load(pathToCalibration + 'proWrtBBExtrinsicRotation.xml');
-    #proWrtBBExtrinsicTranslation = cv.Load(pathToCalibration + 'proWrtBBExtrinsicTranslation.xml');
-    srWrtArm = cv.Load(pathToCalibration + 'srWrtArm.xml');
-    upperTilt = cv.Load(pathToCalibration + 'upperTilt.xml');
-  except Exception as ex:
-    rospy.logfatal(__name__ + ': unable to load calibration files at: %s.  Error: %s' % (pathToCalibration, ex));
-    sys.exit();
-
 
 def msg2cvmat(image):
   ''' converts a ros Image msg to cv image '''
