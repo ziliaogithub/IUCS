@@ -9,7 +9,7 @@ import threading
 import numpy as np
 import scipy as sp
 
-import roslib; roslib.load_manifest('scripting_util')
+import roslib; roslib.load_manifest('ros_python_util')
 import rospy
 import cv
 import cv_bridge
