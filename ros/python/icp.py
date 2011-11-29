@@ -20,7 +20,6 @@ import geometry_msgs.msg as geometry_msgs
 import RosUtil as ru
 import Transform as tr
 import PointCloudUtil as pcu
-import led
 
 import ObjectModel as om
 
@@ -102,6 +101,10 @@ def icp(data, model, thres=.001, maxIter=1000):
     compute icp on two point sets
 
     matrix: DxN
+
+    return:
+      qr - quaterion rotation
+      qt - translation
   '''
   # augment if needed
   if data.shape[0] == 3:
@@ -139,68 +142,4 @@ def icp(data, model, thres=.001, maxIter=1000):
     count += 1;
 
   return (qr, qt, dk);
-
-def get_pose_T(pts):
-  ''' 
-    returns 4x4 transform matrix 
-    current pose -> desired pose
-
-    pts - DxN matrix (D= 3,4)
-
-    return: T (4x4 transform)
-
-    correctedPts = np.dot(T, pts);
-  '''
-  pts = pts[:3,:].copy();
-
-  # translation
-  trans = -1 * np.mean(pts, axis=1);
-  pts = np.transpose(pts.T + trans);
-
-  # orientation
-  cov = np.cov(pts);
-  u,s,vh = np.linalg.svd(cov);
-
-  # format transform matrix
-  R = np.eye(4);
-  R[:3, :3] = vh;
-  t = np.eye(4);
-  t[:3, 3] = trans;
-  T = np.dot(R, t);
-
-  return T;
-
-
-def compute_pose(name, point_cloud, seed=None, thres=.001, maxIter=1000, leafSize=[0.005, 0.005, 0.005]):
-  ''' 
-    computes the pose of the point cloud data for the given object 
-    returns (T, dk) where T is a 4x4 homogeneous matrix
-    
-    seed is an estimate of the object's pose.
-    
-    leafSize is ammount to downsample point clouds, larger numbers are more sparse.
-  '''
-  led.set_right('y');
-  model = ru.to_array(pcu.downsample(om.get_model(name, resolution='mdres'), leafSize=leafSize));
-  data = ru.to_array(pcu.downsample(ru.to_PointCloud(point_cloud), leafSize=leafSize));
-
-  model = np.vstack((model.T, np.ones(model.shape[0])));
-  data = np.vstack((data.T, np.ones(data.shape[0])));
-
-  # initial transform to seed icp
-  if seed == None:
-    seedT = get_pose_T(data);
-  else:
-    seedT = np.linalg.inv(ru.to_array(seed));
-  
-  seededData = np.dot(seedT, data);
-  
-  # compute icp
-  (qr, qt, dk) = icp(seededData, model, thres, maxIter);
-  icpT = np.dot(tr.trans(qt), tr.quat2rot(qr));
-
-  # full transform
-  T = np.linalg.inv(np.dot(icpT, seedT));
-  led.set_right('k');
-  return (T, dk);
 
