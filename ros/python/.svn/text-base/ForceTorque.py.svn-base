@@ -1,0 +1,79 @@
+import sys
+import time
+import math
+import copy 
+import numpy as np
+import scipy as sp 
+import threading
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+import tf
+import PyKDL as kdl
+
+import std_msgs.msg as std_msgs
+import geometry_msgs.msg as geometry_msgs
+import visualization_msgs.msg as visualization_msgs
+
+import pr_msgs.msg as pr_msgs
+import pr_msgs.srv as pr_srvs
+
+import RosUtil as ru
+
+ftLock = threading.Lock();
+stamp = None
+force = np.zeros(3);
+torque = np.zeros(3);
+
+def ForceTorqueCallback(data):
+  global force
+  global torque
+  global stamp
+  global ftLock
+
+  with ftLock:
+    stamp = data.header.stamp
+    force[0] = data.wrench.force.x;
+    force[1] = data.wrench.force.y;
+    force[2] = data.wrench.force.z;
+    torque[0] = data.wrench.torque.x;
+    torque[1] = data.wrench.torque.y;
+    torque[2] = data.wrench.torque.z;
+
+## setup ros subscribers
+rospy.logdebug(__name__ + ': setting up subscribers...');
+# owd 
+rospy.Subscriber('/owd/forcetorque', geometry_msgs.WrenchStamped, ForceTorqueCallback, None, 1)
+
+## setup ros services
+rospy.logdebug(__name__ + ': Setting up service connections...')
+# owd 
+TareForceTorque = ru.service_proxy('/owd/ft_tare', pr_srvs.Reset, not ru.is_sim());
+
+def tare():
+  ''' tare the force torque sensor (zero it) '''
+  rospy.loginfo(__name__ + ': taring force/torque sensor');
+
+  try:
+    TareForceTorque();
+  except:
+    rospy.logerr(__name__ + '.tare: TareForceTorque service request failed');
+    return False;
+
+  return True;
+
+def get_force_torque():
+  with ftLock:
+    return (force.copy(), torque.copy());
+
+def get_force():
+  with ftLock:
+    return force.copy();
+
+def get_torque():
+  with ftLock:
+    return torque.copy();
+
+def cleanup():
+  ''' this is designed to be called for preempts '''
+

@@ -1,0 +1,190 @@
+import time
+import math
+import copy 
+import numpy as np
+import scipy as sp 
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+
+import std_msgs.msg as std_msgs
+import geometry_msgs.msg as geometry_msgs
+import sensor_msgs.msg as sensor_msgs
+import message_filters
+
+import prosilica_msgs.msg as Prosilica_msgs
+import prosilica_msgs.srv as Prosilica_srvs
+
+import Perception_msgs_upenn.msg as Perception_msgs
+
+import RosUtil as ru
+
+PRO_COLOR_TOPIC = '/Prosilica/rgb_image';
+PRO_CAM_INFO = '/Prosilica/rgb_image';
+
+PROMODE_CONTINUOUS = 0;
+PROMODE_TRIGGERED = 1;
+PROMODE_NONE = 2;
+
+properties = Prosilica_msgs.CamProperties();
+info = Prosilica_msgs.CamInfo();
+
+def ProsilicaPropertiesCallback(data):
+  global properties
+  properties = data;
+
+def ProsilicaInfoCallback(data):
+  global info 
+  info = data;
+
+
+## setup ros subscribers
+rospy.logdebug('Prosilica: Setting up subscribers...');
+# re2
+rospy.Subscriber('/Prosilica/cam_properties', Prosilica_msgs.CamProperties, ProsilicaPropertiesCallback, None, 1);
+rospy.Subscriber('/Prosilica/cam_info', Prosilica_msgs.CamInfo, ProsilicaInfoCallback, None, 1);
+
+## setup publishers
+rospy.logdebug('Prosilica: Setting up publishers...');
+shutterPub = rospy.Publisher('/Prosilica/shutter', Perception_msgs.ShutterStamped);
+
+## setup services
+rospy.logdebug('Prosilica: Setting up service connections...')
+# re2 
+getEnumService = ru.service_proxy('/Prosilica/get_enum', Prosilica_srvs.GetEnum, not ru.is_sim());
+getUInt32Service = ru.service_proxy('/Prosilica/get_uint32', Prosilica_srvs.GetUint32, not ru.is_sim());
+setRoIService = ru.service_proxy('/Prosilica/set_ROI', Prosilica_srvs.SetROI, not ru.is_sim());
+setBinningService = ru.service_proxy('/Prosilica/set_binning', Prosilica_srvs.SetBinning, not ru.is_sim());
+setEnumService = ru.service_proxy('/Prosilica/set_enum', Prosilica_srvs.SetEnum, not ru.is_sim());
+setExposureService = ru.service_proxy('/Prosilica/set_exposure', Prosilica_srvs.SetExposure, not ru.is_sim());
+setGainService = ru.service_proxy('/Prosilica/set_gain', Prosilica_srvs.SetGain, not ru.is_sim());
+setModeService = ru.service_proxy('/Prosilica/set_mode', Prosilica_srvs.SetMode, not ru.is_sim());
+setUInt32Service = ru.service_proxy('/Prosilica/set_uint32', Prosilica_srvs.SetUint32, not ru.is_sim());
+setWhiteBalanceService = ru.service_proxy('/Prosilica/set_white_bal', Prosilica_srvs.SetWhiteBalance, not ru.is_sim());
+triggerImageService = ru.service_proxy('/Prosilica/trigger_image', Prosilica_srvs.TriggerImage, not ru.is_sim());
+
+
+def mode2str(mode):
+  if mode == 0:
+    return 'Continuous';
+  if mode == 1:
+    return 'Triggered';
+  if mode == 2:
+    return 'None';
+  return ('Unknown Mode %d' % mode)
+
+def get_enum(attribute):
+  try:
+    resp = getEnumService(attribute);
+    return resp.value;
+  except rospy.ServiceException, e:
+    rospy.logerr('Prosilica: GetEnum service request failed:\t%s' % str(e));
+
+def get_uint32(attribute):
+  try:
+    resp = getUInt32Service(attribute);
+    return resp.value;
+  except rospy.ServiceException, e:
+    rospy.logerr('Prosilica: GetUInt32 service request failed:\t%s' % str(e));
+
+
+def set_roi(regionX, regionY, width, height):
+  try:
+    resp = setRoIService(regionX, regionY, width, height);
+    rospy.loginfo('Prosilica: set region of interest to (%d, %d):(%d, %d)' % (resp.regionX, resp.regionY, resp.width, resp.height));
+  except rospy.ServiceException, e:
+    rospy.logerr('Prosilica: SetConfigFile service request failed:\t%s' % str(e));
+
+def set_binning(binningX, binningY):
+  try:
+    resp = setBinningService(binningX, binningY);
+    rospy.loginfo('Prosilica: set binning (%d, %d)' % (resp.binningX, resp.binningY));
+  except rospy.ServiceException, e:
+    rospy.logerr('Prosilica: SetBinning service request failed:\t%s' % str(e));
+
+def set_enum(attribute, value):
+  try:
+    resp = setEnumService(attribute, value);
+    rospy.loginfo('Prosilica: set attribute %s = %s' % (resp.attribute, resp.value));
+  except rospy.ServiceException, e:
+    rospy.logerr('Prosilica: SetEnum service request failed:\t%s' % str(e));
+
+def set_exposure(value, autoOn=False, onePush=False):
+  try:
+    resp = setExposureService(autoOn, onePush, value);
+    rospy.loginfo('Prosilica: set exposure value=%d autoOn=%s onePush=%s' % (resp.value, resp.autoOn, resp.onePush));
+  except rospy.ServiceException, e:
+    rospy.logerr('Prosilica: SetExposure service request failed:\t%s' % str(e));
+
+def set_gain(value, autoOn=False, onePush=False):
+  try:
+    resp = setGainService(autoOn, onePush, value);
+    rospy.loginfo('Prosilica: set gain value=%d autoSet=%s manualPush=%s' % (resp.value, resp.autoOn, resp.onePush));
+  except rospy.ServiceException, e:
+    rospy.logerr('Prosilica: SetGain service request failed:\t%s' % str(e));
+
+def set_mode(mode):
+  ''' sets the prosilica mode '''
+  try:
+    resp = setModeService(mode);
+    rospy.loginfo('Prosilica: set mode %d (%s)' % (resp.mode, mode2str(resp.mode)));
+  except rospy.ServiceException, e:
+    rospy.logerr('Prosilica: SetMode service request failed:\t%s' % str(e));
+
+def set_uint32(attribute, value):
+  try:
+    resp = setUInt32Service(attribute, value);
+    rospy.loginfo('Prosilica: set uint32 %s = %d' % (resp.attribute, resp.value));
+  except rospy.ServiceException, e:
+    rospy.logerr('Prosilica: SetUInt32 service request failed:\t%s' % str(e));
+
+
+def set_white_balance(redValue, blueValue, autoOn=False, onePush=False):
+  try:
+    resp = setWhiteBalanceService(redValue, blueValue, autoOn, onePush);
+    rospy.loginfo('Prosilica: set white balance redValue=%0.3f blueValue=%0.3f autoSet=%s manualPush=%s' % (resp.redValue, resp.blueValue, resp.autoOn, resp.onePush));
+  except rospy.ServiceException, e:
+    rospy.logerr('Prosilica: SetWhiteBalance service request failed:\t%s' % str(e));
+
+def trigger():
+  ''' service call to trigger prosilica image '''
+  try:
+    resp = triggerImageService();
+  except rospy.ServiceException, e:
+    rospy.logerr('Prosilica: TriggerImage service request failed:\t%s' % str(e));
+    return False;
+  return True;
+
+def all_auto():
+  global properties
+  set_exposure(properties.exposureValue, autoOn=True);
+  set_gain(properties.gainValue, autoOn=True); 
+  set_white_balance(properties.whiteBalRed, properties.whiteBalBlue, autoOn=True);
+
+def auto_off():
+  global properties
+  set_exposure(properties.exposureValue, autoOn=False);
+  set_gain(properties.gainValue, autoOn=False); 
+  set_white_balance(properties.whiteBalRed, properties.whiteBalBlue, autoOn=False);
+
+def shutter():
+  ''' shutters Prosilica image '''
+  t0 = rospy.Time().now();
+  shutterPub.publish(Perception_msgs.ShutterStamped(rospy.Header(0, t0, '/baseLink')));
+
+def get_image(timeout=0.5):
+  ''' returns the prosilica image msg '''
+  if (properties.mode == PROMODE_NONE):
+    # set to triggered
+    set_mode(PROMODE_TRIGGERED);
+  
+  # wait for message
+  while (True):
+    if (properties.mode == PROMODE_TRIGGERED):
+      trigger();
+    try:
+      return rospy.wait_for_message(PRO_COLOR_TOPIC, sensor_msgs.Image, timeout);
+    except rospy.ROSException, e:
+      if (properties.mode == PROMODE_TRIGGERED):
+        rospy.logwarn(__name__ + ': no image received in triggering again: %s' % e);
+

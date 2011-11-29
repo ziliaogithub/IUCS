@@ -1,0 +1,273 @@
+import time
+import math
+import copy 
+import string
+import numpy as np
+import scipy as sp 
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+import tf
+import PyKDL as kdl
+
+import std_msgs.msg as std_msgs
+import geometry_msgs.msg as geometry_msgs
+import sensor_msgs.msg as sensor_msgs
+
+import DPPanTilt_msgs.msg as DPPanTilt_msgs
+
+import Track_msgs.msg as Track_msgs
+import Neck_msgs_upenn.msg as Neck_msgs_upenn
+
+import RosUtil as ru
+
+
+DPPTMODE_POSITION = 0;
+DPPTMODE_VELOCITY = 1;
+
+lowerPosMode = False; 
+upperPosMode = False; 
+
+lowerPT = np.zeros(2);
+upperPT = np.zeros(2);
+lowerPTVel = np.zeros(2);
+upperPTVel = np.zeros(2);
+
+# default limits
+lowerPTLowerLimit = np.array([-2.9527323246, -1.22173047066]);
+lowerPTUpperLimit = np.array([2.9217646122, 1.22173047066]);
+upperPTLowerLimit = np.array([-1.57079637051, -1.30899596214]);
+upperPTUpperLimit = np.array([1.57079637051, 0.521744012833]);
+
+# TODO: does anyone use these?
+lowerPanLimits = np.array([0.0, -1.2]);
+lowerTiltLimits = np.array([0.0, -1.2]);
+upperPanLimits = np.array([-1.57008481, 1.57008481]);
+upperTiltLimits = np.array([-1.30895948, 0.52174366]);
+
+
+def LowerPanTiltStaticInfoCallback(data):
+  global lowerPTLowerLimit 
+  global lowerPTUpperLimit 
+  lowerPTLowerLimit[0] = data.panMinimumValidPositionInRadians;
+  lowerPTLowerLimit[1] = data.tiltMinimumValidPositionInRadians;
+  lowerPTUpperLimit[0] = data.panMaximumValidPositionInRadians;
+  lowerPTUpperLimit[1] = data.tiltMaximumValidPositionInRadians;
+
+def UpperPanTiltStaticInfoCallback(data):
+  global upperPTLowerLimit 
+  global upperPTUpperLimit 
+  upperPTLowerLimit[0] = data.panMinimumValidPositionInRadians;
+  upperPTLowerLimit[1] = data.tiltMinimumValidPositionInRadians;
+  upperPTUpperLimit[0] = data.panMaximumValidPositionInRadians;
+  upperPTUpperLimit[1] = data.tiltMaximumValidPositionInRadians;
+
+def LowerPanTiltDynamicInfoCallback(data):
+  global lowerPT
+  global lowerPTVel
+  global lowerPosMode
+  lowerPT[0] = data.panPositionInRadians;
+  lowerPT[1] = data.tiltPositionInRadians;
+  lowerPTVel[0] = data.panVelocityInRadiansPerSec;
+  lowerPTVel[1] = data.tiltVelocityInRadiansPerSec;
+  lowerPosMode = data.currentlyInPositionControl;
+
+def UpperPanTiltDynamicInfoCallback(data):
+  global upperPT
+  global lowerPTVel
+  global upperPosMode
+  upperPT[0] = data.panPositionInRadians;
+  upperPT[1] = data.tiltPositionInRadians;
+  upperPTVel[0] = data.panVelocityInRadiansPerSec;
+  upperPTVel[1] = data.tiltVelocityInRadiansPerSec;
+  upperPosMode = data.currentlyInPositionControl;
+
+
+## setup ros subscribers
+rospy.logdebug(__name__ + ': setting up subscribers...');
+# re2
+rospy.Subscriber('/LowerPanTilt/report_static_info', DPPanTilt_msgs.ReportStaticInfo, LowerPanTiltStaticInfoCallback, None, 1)
+rospy.Subscriber('/UpperPanTilt/report_static_info', DPPanTilt_msgs.ReportStaticInfo, UpperPanTiltStaticInfoCallback, None, 1)
+rospy.Subscriber('/LowerPanTilt/report_dynamic_info', DPPanTilt_msgs.ReportDynamicInfo, LowerPanTiltDynamicInfoCallback, None, 1)
+rospy.Subscriber('/UpperPanTilt/report_dynamic_info', DPPanTilt_msgs.ReportDynamicInfo, UpperPanTiltDynamicInfoCallback, None, 1)
+
+## setup publishers
+rospy.logdebug(__name__ + ': setting up publishers...');
+# re2
+lowerPanPub = rospy.Publisher('/LowerPanTilt/set_absolute_position_pan', DPPanTilt_msgs.SetAbsolutePositionPan);
+lowerTiltPub = rospy.Publisher('/LowerPanTilt/set_absolute_position_tilt', DPPanTilt_msgs.SetAbsolutePositionTilt);
+upperPanPub = rospy.Publisher('/UpperPanTilt/set_absolute_position_pan', DPPanTilt_msgs.SetAbsolutePositionPan);
+upperTiltPub = rospy.Publisher('/UpperPanTilt/set_absolute_position_tilt', DPPanTilt_msgs.SetAbsolutePositionTilt);
+lowerPanPosSpeedPub = rospy.Publisher('/LowerPanTilt/set_speed_for_position_moves_pan', DPPanTilt_msgs.SetSpeedForPositionMovesPan);
+lowerTiltPosSpeedPub = rospy.Publisher('/LowerPanTilt/set_speed_for_position_moves_tilt', DPPanTilt_msgs.SetSpeedForPositionMovesTilt);
+upperPanPosSpeedPub = rospy.Publisher('/UpperPanTilt/set_speed_for_position_moves_pan', DPPanTilt_msgs.SetSpeedForPositionMovesPan);
+upperTiltPosSpeedPub = rospy.Publisher('/UpperPanTilt/set_speed_for_position_moves_tilt', DPPanTilt_msgs.SetSpeedForPositionMovesTilt);
+lowerPanVelPub = rospy.Publisher('/LowerPanTilt/set_velocity_pan', DPPanTilt_msgs.SetVelocityPan);
+lowerTiltVelPub = rospy.Publisher('/LowerPanTilt/set_velocity_tilt', DPPanTilt_msgs.SetVelocityTilt);
+upperPanVelPub = rospy.Publisher('/UpperPanTilt/set_velocity_pan', DPPanTilt_msgs.SetVelocityPan);
+upperTiltVelPub = rospy.Publisher('/UpperPanTilt/set_velocity_tilt', DPPanTilt_msgs.SetVelocityTilt);
+lowerPositionControlPub = rospy.Publisher('/LowerPanTilt/start_position_control', DPPanTilt_msgs.StartPositionControl);
+upperPositionControlPub = rospy.Publisher('/UpperPanTilt/start_position_control', DPPanTilt_msgs.StartPositionControl);
+lowerVelocityControlPub = rospy.Publisher('/LowerPanTilt/start_velocity_control', DPPanTilt_msgs.StartVelocityControl);
+upperVelocityControlPub = rospy.Publisher('/UpperPanTilt/start_velocity_control', DPPanTilt_msgs.StartVelocityControl);
+rospy.sleep(1.0);
+
+## setup actionlib servers
+rospy.logdebug(__name__ + ': setting up actionlib connections...')
+# neck control actionlib connection
+neckControlClient = ru.actionlib_proxy('/UpperPanTilt/upenn_neck_actionlib_server', Neck_msgs_upenn.NeckControlAction, not ru.is_sim());
+
+def set_mode(mode):
+  ''' sets the neck in the given mode '''
+  if mode == DPPTMODE_POSITION:
+    rospy.logdebug(__name__ + ': setting neck to position control');
+    lowerPositionControlPub.publish(DPPanTilt_msgs.StartPositionControl())
+    upperPositionControlPub.publish(DPPanTilt_msgs.StartPositionControl())
+  elif mode == DPPTMODE_VELOCITY:
+    rospy.logdebug(__name__ + ': setting neck to velocity control');
+    lowerVelocityControlPub.publish(DPPanTilt_msgs.StartVelocityControl())
+    upperVelocityControlPub.publish(DPPanTilt_msgs.StartVelocityControl())
+  else:
+    rospy.logwarn(__name__ + ': unkown neck mode %d' % mode);
+
+def set_position_control():
+  ''' 
+    DEPRICATED: use set_mode
+    
+    sets the neck in position control 
+  '''
+  set_mode(DPPTMODE_POSITION);
+
+def set_lower_position_speed(pan, tilt):
+  ''' sets the position control speed for the lower pan/tilt '''
+  rospy.logdebug(__name__ + ': setting lower pan/tilt position move speed to (%0.3f, %0.3f)' % (pan, tilt));
+  lowerPanPosSpeedPub.publish(DPPanTilt_msgs.SetSpeedForPositionMovesPan(pan));
+  lowerTiltPosSpeedPub.publish(DPPanTilt_msgs.SetSpeedForPositionMovesTilt(tilt));
+
+def set_upper_position_speed(pan, tilt):
+  ''' sets the position control speed for the upper pan/tilt '''
+  rospy.logdebug(__name__ + ': setting upper pan/tilt position move speed to (%0.3f, %0.3f)' % (pan, tilt));
+  upperPanPosSpeedPub.publish(DPPanTilt_msgs.SetSpeedForPositionMovesPan(pan));
+  upperTiltPosSpeedPub.publish(DPPanTilt_msgs.SetSpeedForPositionMovesTilt(tilt));
+
+
+def move_neck(lower, upper, block=False, timeout=8.0):
+  '''
+  Moves the neck to a desired position.
+  
+  @param lower  A list of [pan, tilt] angles for the lower PT unit.
+  @param upper  A list of [pan, tilt] angles for the upper PT unit.
+  @param block  boolean True to wait until done moving.
+  '''
+
+  # send commands
+  lowerPanPub.publish(DPPanTilt_msgs.SetAbsolutePositionPan(lower[0]));
+  lowerTiltPub.publish(DPPanTilt_msgs.SetAbsolutePositionTilt(lower[1]));
+  upperPanPub.publish(DPPanTilt_msgs.SetAbsolutePositionPan(upper[0]));
+  upperTiltPub.publish(DPPanTilt_msgs.SetAbsolutePositionTilt(upper[1]));
+  # now uses neck controller
+  #move_upper_pt(upper);
+
+  eps = 0.05;
+  t0 = rospy.Time.now().to_sec();
+  while block:
+    t = rospy.Time.now().to_sec();
+    dt = t - t0;
+
+    dlower = np.abs(lower - lowerPT)
+    dupper = np.abs(upper - upperPT)
+
+    if (dt > timeout):
+      rospy.logwarn(__name__ + ': move_neck: timeout on move');
+      break;
+
+    if (np.all(dlower < eps) and np.all(dupper < eps)):
+      break;
+
+    # wait until the head is in the desired position 
+    rospy.sleep(0.05);
+
+
+def move_upper_pt(pt, wait=False, timeout=0):
+  '''
+    set the upper neck pan, tilt
+  '''
+  global neckControlClient 
+
+  goal = Neck_msgs_upenn.NeckControlGoal();
+  goal.command = goal.ANGLES;
+  goal.pan = pt[0];
+  goal.tilt = pt[1];
+
+  neckControlClient.send_goal(goal); 
+
+  if wait:
+    return wait_for_result(timeout);
+
+def set_upper_vel(pt):
+  global upperPanVelPub, upperTiltVelPub
+  upperPanVelPub.publish(DPPanTilt_msgs.SetVelocityPan(pt[0]));
+  upperTiltVelPub.publish(DPPanTilt_msgs.SetVelocityTilt(pt[1]));
+
+def look(pt, cameraFrame='', wait=False, timeout=5.0):
+  '''
+    look at a cartesian point
+    
+    pt - point in the world
+  '''
+  global neckControlClient 
+
+  goal = Neck_msgs_upenn.NeckControlGoal();
+  goal.command = goal.LOOK;
+  goal.point = ru.to_PointStamped(pt);
+  goal.camera_frame_id = cameraFrame;
+
+  neckControlClient.send_goal(goal); 
+
+  if wait:
+    return wait_for_result(timeout);
+    
+def track(p, trackFrame=ru.BASE_FRAME, cameraFrame=''):
+  '''
+    track a cartesian point
+    
+    p - point (if array or Point then BASE_FRAME is assumed)
+  '''
+  global neckControlClient 
+
+  goal = Neck_msgs_upenn.NeckControlGoal();
+  goal.command = goal.TRACK;
+  goal.point = ru.to_PointStamped(pt, frame_id=trackFrame);
+  goal.camera_frame_id = cameraFrame;
+
+  #neckControlClient.send_goal(goal); 
+
+
+def wait_for_result(timeout=5.0):
+  ''' 
+    wait for the neck action server to finish 
+    ret = (done, result)
+  '''
+  global neckControlClient
+
+  done = neckControlClient.wait_for_result(rospy.Duration(timeout));
+  res = None;
+  if done:
+    res = neckControlClient.get_result();
+
+  return (done, res);
+
+def preempt():
+  ''' preempts the neck control actionlib server '''
+  global neckControlClient
+  neckControlClient.cancel_all_goals();
+
+def stop():
+  ''' preempts the neck control actionlib server '''
+  global neckControlClient
+  neckControlClient.cancel_all_goals();
+
+def cleanup():
+  ''' this is designed to be called for preempts '''
+  preempt();
+

@@ -1,0 +1,2126 @@
+#!/usr/bin/env python  
+
+import os
+import sys
+import time
+import copy
+import string
+import threading
+import numpy as np
+import scipy as sp
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+import cv
+import cv_bridge
+
+import tf
+import PyKDL as kdl
+import actionlib
+
+import message_filters
+
+import std_msgs.msg as std_msgs
+import sensor_msgs.msg as sensor_msgs
+import geometry_msgs.msg as geometry_msgs
+
+import pr_msgs.msg as pr_msgs 
+import Perception_msgs_upenn.msg as Perception_msgs
+
+import Transform as tr
+
+BASE_FRAME = rospy.get_param('/robot_base_frame', '/base_link');
+ARM_FIXED_FRAME = '/rightWamFixedShoulderLink';
+TIP_FRAME = rospy.get_param('/tip_name', '/DarmSim/RightArm/WAM/LowerWristFTPalmLink');
+WRIST_FRAME = TIP_FRAME;
+PALM_FRAME = '/DarmSim/RightArm/WAM/PalmLink';
+FT_FRAME = '/DarmSim/RightArm/WAM/ForceTorqueLink';
+ROBOT_NAME = rospy.get_param('/robot_name', 'GFE');
+BBL_FRAME = '/DarmSim/BumbleBee2LeftEyeLink';
+BBR_FRAME = '/DarmSim/BumbleBee2RightEyeLink';
+SR_FRAME = '/DarmSim/SR4000Link';
+PRO_FRAME = '/DarmSim/ProsilicaLink';
+IS_SIMULATION = rospy.get_param('/is_simulation', False);
+
+rospy.loginfo(rospy.get_name() + ':' + __name__ + ': Initializing for %s robot' % ROBOT_NAME);
+if IS_SIMULATION: rospy.loginfo(rospy.get_name() + ':' + __name__ + ': Simulation enviornment detected.');
+
+def get_robot_name():
+  return ROBOT_NAME;
+
+def is_upenn():
+  return ROBOT_NAME == 'Penn';
+
+def is_simulation():
+  return IS_SIMULATION; 
+
+def is_sim():
+  return is_simulation();
+
+# log publisher
+logPub = rospy.Publisher('/log', std_msgs.Empty);
+def stereo_log():
+  logPub.publish();
+
+
+init = False;
+listener = None;
+transformer = tf.TransformerROS(True);
+
+def init_utils():
+  ''' 
+    initializes all utilities that need to be 
+      initialized after init_node is called
+    
+    *** THIS MUST BE CALLED AFTER rospy.init_node() ***
+  '''
+  global init
+  global listener 
+
+  if not init:
+  
+    rospy.loginfo(rospy.get_name() + ':' + __name__ + ': registering tf listener...');
+    listener = tf.TransformListener();
+
+    init = True;
+
+def service_proxy(name, msgType, wait=True, timeout=5.0):
+  ''' setup ros service '''
+  try:
+    if (wait):
+      rospy.logdebug(rospy.get_name() + ':' + __name__ + ': waiting for %s...' % name);
+      rospy.wait_for_service(name, timeout);
+    rospy.logdebug(rospy.get_name() + ':' + __name__ + ': creating service proxy to %s...' % name);
+    srvProxy = rospy.ServiceProxy(name, msgType)
+    if (wait):
+      rospy.logdebug(rospy.get_name() + ':' + __name__ + ': %s connection made' % name)
+  except rospy.ROSException as err:
+    rospy.logfatal(rospy.get_name() + ':' + __name__ + ': service connection failed: %s :: %s' % (name, err));
+    sys.exit();
+  return srvProxy
+
+def actionlib_proxy(name, msgType, wait=True):
+  ''' setup ros service '''
+  try:
+    rospy.logdebug(rospy.get_name() + ':' + __name__ + ': creating actionlib %s connection...' % name);
+    c = actionlib.SimpleActionClient(name, msgType);
+    # TODO: wait for server never returns...
+    #if (wait):
+    if (False):
+      rospy.logdebug(rospy.get_name() + ':' + __name__ + ': waiting for %s...' % name);
+      rospy.sleep(0.2);
+      c.wait_for_server();
+      rospy.logdebug(rospy.get_name() + ':' + __name__ + ': %s connection made' % name)
+  except:
+    rospy.logfatal(rospy.get_name() + ':' + __name__ + ': no service connection %s possible' % name);
+    sys.exit();
+  return c;
+
+
+def wait_for_sync_message(topics, types, timeout=2.0):
+  '''
+    similar to rospy.wait_for_message but for time synced messages
+  '''
+  global data, receivedData
+  data = [];
+  receivedData = False;
+
+  def sync_callback(*args):
+    ''' callback for synced messages '''
+    global data, receivedData
+    # only store the first message received
+    if not receivedData:
+      data = args;
+      receivedData = True;
+
+  subs = [];
+  for i in np.arange(len(topics)):
+    subs.append(message_filters.Subscriber(topics[i], types[i]));
+  
+  synchronizer = message_filters.TimeSynchronizer(subs, 1);
+  synchronizer.registerCallback(sync_callback);
+
+  # wait for the data
+  t0 = rospy.Time().now().to_sec();
+  while (not receivedData and rospy.Time().now().to_sec() - t0 < timeout):
+    rospy.sleep(0.01);
+
+  # unregister topics
+  map(lambda sub: sub.sub.unregister(), subs);
+
+  if not receivedData:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': wait_for_sync_message: no data received for topics %s' % topics);
+
+  return data;
+
+
+def get_tr(trans, rot):
+  return transformer.fromTranslationRotation(trans, rot);
+
+
+def get_transform(srcFrame, dstFrame, rtime=rospy.Time(), blocklen=rospy.Duration(0)):
+  if(blocklen > rospy.Duration(0)):
+    listener.waitForTransform(dstFrame, srcFrame, rtime, blocklen)
+    
+  tr = listener.lookupTransform(dstFrame, srcFrame, rtime);
+  return transformer.fromTranslationRotation(tr[0], tr[1]);
+
+# # takes a 4x4 transform matrix
+# def tr2pose(tr):
+#   kdlR = kdl.Rotation(tr[0,0],tr[0,1],tr[0,2],
+#                       tr[1,0],tr[1,1],tr[1,2],
+#                       tr[2,0],tr[2,1],tr[2,2])
+#   p = to_Pose(tr[0:3,3],kdlR.GetQuaternion())
+#   return p
+
+def pose2tr(pose):
+  (t, r) =  pose2array(pose);
+  return get_tr(t, r);
+  
+# def tf2pose(tr):
+#   return to_Pose(tr);
+
+# def tr2kdl(tr):
+#   kdlR = kdl.Rotation(tr[0,0],tr[0,1],tr[0,2],
+#                       tr[1,0],tr[1,1],tr[1,2],
+#                       tr[2,0],tr[2,1],tr[2,2])
+#   kdlT = kdl.Vector(tr[0,3],tr[1,3],tr[2,3]);
+#   return kdl.Frame(kdlR, kdlT)
+
+# def pose2frame(pose):
+#   ''' converts a ros pose to a kdl frame '''
+#   return to_KDLFrame(pose)
+
+# def pose2kdl(pose):
+#   return to_KDLFrame(pose)
+
+
+# def to_Pose(f):
+#   ''' converts a kdl frame to a ros pose msg '''
+#   p = geometry_msgs.Pose();
+#   p.position.x, p.position.y, p.position.z = f.p.x(), f.p.y(), f.p.z();
+#   p.orientation = geometry_msgs.Quaternion(*f.M.GetQuaternion());
+#   return p;
+
+# def kdl2pose(f):
+#   return frame2pose(f);
+
+def translate_pose(pose, trans):
+  ''' translates a pose with respect to the poses orientation '''
+  if type(trans) != kdl.Vector:
+    t = kdl.Vector(trans[0], trans[1], trans[2]);
+  else:
+    t = trans;
+  frame = to_KDLFrame(pose);
+  
+  frame.p += frame.M * t;
+
+  return to_Pose(frame);
+  
+def transform_with_frames(srcFrame, dstFrame, points, rtime=rospy.Time()):
+  tr = get_transform(srcFrame, dstFrame, rtime);
+  return transform_points(tr, points);
+
+def transform_points(tr, points):
+  ''' points should be Nx3 '''
+  if len(points.shape) == 1:
+    points = np.array([points]);
+  pts = np.hstack((points, np.ones((points.shape[0],1))));
+  pts = np.dot(pts, tr.T);
+  return pts[:,0:3];
+
+# def array2point(p):
+#   return geometry_msgs.Point(p[0], p[1], p[2]);
+
+def point2array(p):
+  return np.array([p.x, p.y, p.z]);
+
+
+# def array2quaternion(o):
+#   if len(o) == 3:
+#     q = geometry_msgs.Quaternion()
+#     (q.x, q.y, q.z, q.w) = kdl.Rotation.RPY(o[0], o[1], o[2]).GetQuaternion();
+#     return q
+#   else:
+#     return geometry_msgs.Quaternion(o[0], o[1], o[2], o[3]);
+  
+def quaternion2array(o):
+  return np.array([o.x, o.y, o.z, o.w]);
+
+# def array2pose(p, o):
+#   return geometry_msgs.Pose(to_Point(p), to_Quaternion(o));
+
+def pose2array(p):
+  return (point2array(p.position), quaternion2array(p.orientation));
+
+
+def array2cloud(c, frame_id=''):
+  return array2pc(c, frame_id);
+
+def array2pc(c, frame_id=''):
+  ''' array should be Nx3 '''
+  pc = sensor_msgs.PointCloud();
+  pc.header.frame_id = frame_id; 
+
+  shape = c.shape;
+  if len(shape) == 1:
+    # only one point given
+    pc.points.append(to_Point(c));
+    return pc;
+
+  i = 0;
+  n = c.shape[0];
+  while i < n:
+    pc.points.append(to_Point(c[i,:]));
+    i += 1;
+
+  return pc;
+
+def cloud2array(pc):
+  return pc2array(pc);
+  
+def pc2array(pc):
+  ''' return array will be Nx3 '''
+  n = len(pc.points);
+  c = np.empty((n, 3));
+  
+  i = 0;
+  while i < n:
+    c[i,0] = pc.points[i].x;
+    c[i,1] = pc.points[i].y;
+    c[i,2] = pc.points[i].z;
+    i += 1;
+
+  return c;
+
+
+def eigen2quaternion(vectors, values=None):
+  ''' 
+    converts eigen vectors to quaternion orientation 
+
+    if eigen values are provided it will sort the vectors
+    if no values are provided it is assumed the vectors are sorted
+
+    vectors should be in Nx3 format (N will always be 3)
+      NxPoint and Nx3 array inputs are supported
+
+    returns the Quaternion as an array
+  ''' 
+  evec = None; 
+  if (type(vectors[0]) == geometry_msgs.Point
+      or type(vectors[0]) == geometry_msgs.Point32):
+    # convert to array format
+    evec = np.empty((3,3));
+
+    i = 0;
+    while i < 3:
+      evec[i,:] = point2array(vectors[i]);
+      i += 1;
+
+  else:
+    evec = vectors;
+
+
+  # sort if needed (max->min)
+  sind = np.arange(3);
+  if values:
+    if (type(values) == geometry_msgs.Point
+        or type(values) == geometry_msgs.Point32):
+      sind = np.argsort(point2array(values))[::-1];
+    else:
+      sind = np.argsort(values)[::-1];
+
+  # create quaternion
+  evecn = copy.deepcopy(evec[sind,:]);
+  evecn = (evecn.T / np.sqrt(np.sum((evecn**2), axis=1))).T;
+  rot = kdl.Rotation( evecn[0, 0], evecn[1, 0], evecn[2, 0],
+                      evecn[0, 1], evecn[1, 1], evecn[2, 1],
+                      evecn[0, 2], evecn[1, 2], evecn[2, 2]);
+
+  return rot.GetQuaternion();
+
+def blob2pose(blob):
+  ''' converts a Blob message to a Pose message '''
+  pose = geometry_msgs.Pose();
+  pose.position = to_Point(blob.centroid);
+  q = eigen2quaternion(blob.eigenvectors, blob.eigenvalues);
+  pose.orientation = to_Quaternion(q);
+  return pose;
+
+################################################################
+# a few utilities for handling geometry_msgs.Point[32]
+# (this should handle either Point or Point32, or anything with x, y, z members)
+
+def point_dist(p1, p2):
+  d = [p1.x - p2.x, p1.y - p2.y, p1.z - p2.z]
+  return np.sqrt(np.sum(np.power(d,2)))
+
+# copy a point -- useful for converting a Point32 to a Point64 or vice versa
+def point_copy(p, q):
+  q.x = p.x
+  q.y = p.y
+  q.z = p.z
+
+
+################################################################
+
+def angle_between(a, b):
+  '''
+    finds the angle between the given vectors in radians
+  '''
+  return np.arctan2(np.linalg.norm(np.cross(a,b)), np.dot(a,b));
+
+
+def angle_on_table(pose, axis=[0.0, 0.0, 1.0]):
+  '''
+  returns the angle on the XY plane of the specified axis of the specified pose.
+  
+  the pose should be in the base frame.
+  
+  pose must be a type that can be converted to to a kdl Frame.
+  axis must be a type that can be converted to a kdl Vector.
+  
+  the 0 angle is in the direction of your base frame's X axis.  
+  positive angles follow right hand rule about Z axis.
+  angle in radians.  in the range [-pi, pi].
+  '''
+  frame = to_KDLFrame(pose)
+  vector = to_KDLVector(axis)
+  vector.Normalize()
+  axis = frame.M * vector
+  axis.Normalize()
+  return np.arctan2(axis.y(), axis.x())
+
+def angle_from_table(pose, axis=[0.0, 0.0, 1.0]):
+  '''
+  returns the angle (in radians) from the XY plane of the specified axis of the
+  specified pose.
+  
+  pose must be a type that can be converted to to a kdl Frame.
+  axis must be a type that can be converted to a kdl Vector.
+  
+  pose should be in the base frame.
+  
+  the 0 angle is parallel to the table.
+  positive angles point out of the table.
+  negative angles point into table.
+  angle in radians.  in the range [-pi/2, pi/2].
+  '''
+  x = to_KDLVector(axis)
+  x.Normalize()
+  z = kdl.Vector(0, 0, 1);
+  f = to_KDLFrame(pose);
+  xp = f.M * x;
+  xp.Normalize()
+  return np.pi/2.0 - np.arccos(kdl.dot(xp, z));
+
+def is_vertical(pose, axis=[1.0, 0.0, 0.0], thres=60.0*np.pi/180.0):
+  '''
+  determines if the specified axis of the specified pose is 'vertical'.
+  i.e. perpendicular to XY plane.
+  
+  axis - vector form of the main axis 
+  thres - angle threshold (from ground plane)
+  
+  pose must be a type that can be converted to to a kdl Frame.
+  axis must be a type that can be converted to a kdl Vector.
+  
+  pose should be in the base frame.
+  
+  see also: angle_from_table()
+  '''
+  
+  angleFromXY = np.abs(angle_from_table(pose, axis));
+  return angleFromXY > thres
+ 
+
+class gen_sub():
+  ''' generic subscriber '''
+  def __init__(self, topic, msgType, nqueue=1):
+    rospy.Subscriber(topic, msgType, self.callback, None, nqueue);
+    self.data = msgType();
+
+  def callback(self, data):
+    self.data = data;
+
+  def get_data(self):
+    return self.data;
+
+class Bag():
+  ''' programatically start and stop rosbag '''
+  def __init__(self, topics, prefix='', timeout=-1):
+    '''
+      topics: list or string containing the topics to record
+      prefix: string prefix to append to the beginning of each bag
+      timeout: optional argument, if its positive then the bag will be started 
+                  immediately and record for timeout time. the bag will stop recording
+                  after timeout seconds. (It will block during this time.
+    '''
+    if (type(topics) == str):
+      args = topics;
+    else:
+      args = string.join(topics);
+    if (not prefix):
+      args += ('-o %s', prefix);
+
+    self.cmd = ('rosbag record %s' % args);
+
+    if (timeout > 0):
+      # start and stop log after timeout
+      self.start();
+      self.stop(timeout);
+
+  def start(self):
+    ''' start recording '''
+    self.process = subprocess.Popen(self.cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE);
+    t0 = rospy.Time().now();
+
+  def get_cids(self):
+    ''' return child ids of the bag process '''
+    # find child process ids
+    pgrepProcess = subprocess.Popen('pgrep -P %d' % self.process.pid, shell=True, stdout=subprocess.PIPE);
+    pgrepProcess.wait();
+    return map(lambda cid: int(string.strip(cid)), pgrepProcess.stdout.readlines());
+
+  def stop(self, timeout=-1, timeoutFromStart=False):
+    ''' stops the bag process '''
+    if (timeout > 0):
+      if (timeoutFromStart):
+        t0 = self.t0;
+      else:
+        t0 = rospy.Time().now();
+
+      # wait timeout
+      rospy.sleep(timeout - (rospy.Time().now().to_sec() - t0.to_sec()));
+
+    # send interrupts to the bagging process
+    cids = self.get_cids();
+    map(lambda cid: os.kill(cid, signal.SIGINT), cids);
+    # wait for the bagging process to finish
+    self.process.wait();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+colors = {};
+colors['black'] = colors['k'] = np.array([0, 0, 0], np.uint8);
+colors['white'] = colors['w'] = np.array([255, 255, 240], np.uint8);
+colors['red'] = colors['r'] = np.array([255, 0, 0], np.uint8);
+colors['green'] = colors['g'] = np.array([0, 255, 0], np.uint8);
+colors['blue'] = colors['b'] = np.array([0, 0, 255], np.uint8);
+colors['yellow'] = colors['y'] = np.array([255, 255, 0], np.uint8);
+colors['magenta'] = colors['m'] = np.array([255, 0, 255], np.uint8);
+colors['cyan'] = colors['c'] = np.array([0, 255, 255], np.uint8);
+
+
+def color2rgba(c):
+  ''' returns r,g,b,a values (0.0 - 1.0) for the given color '''
+
+def color2rgb(c):
+  ''' returns r,g,b values (0.0 - 1.0) for the given color '''
+  global colors
+
+  if (hasattr(c, '__iter__') and len(c) >= 3):
+    # assumed to be an iterable already in r,g,b format
+    return np.array(int(c[:3]));
+  elif type(c) == str:
+    # get the color from the dictionary
+    c = string.lower(c);
+    if c in colors.keys():
+      return colors[c].copy();
+
+  rospy.logwarn(rospy.get_name() + ':' + __name__ + ': unkown color %s' % str(c));
+  return colors['k'].copy();
+
+################################
+
+def is_nan(sometype):
+  ''' 
+    tests if the ros or kdl type contains any nan values.
+    returns true if there is any nan values.
+
+    NOTE: 'None' values count as 'nan'.
+
+    supported input:
+      - int
+      - float
+      - ROS Pose message
+      - ROS PoseStamped message
+      - ROS Point message
+      - ROS PointStamped message
+      - ROS Point32 message
+      - ROS Quaternion message
+      - ROS QuaternionStamped message
+      - ROS Transform message
+      - ROS TransformStamped message
+      - ROS Vector3 message
+      - ROS Vector3Stamped message
+      - kdl Frame
+      - kdl Vector
+      - kdl Rotation
+      - tf transform
+      - iterables
+      - any number of nested types
+      '''
+  
+  if (sometype == None):
+    return True
+  if type(sometype) == int:
+    return np.isnan(sometype);
+  if type(sometype) == float:
+    return np.isnan(sometype);
+  
+  # Pose
+  if type(sometype) == geometry_msgs.Pose:
+    return is_nan(sometype.position) or is_nan(sometype.orientation);
+  # PoseStamped
+  if type(sometype) == geometry_msgs.PoseStamped:
+    return is_nan(sometype.pose.position) or is_nan(sometype.pose.orientation);
+  # Point
+  if type(sometype) == geometry_msgs.Point:
+    return np.isnan(sometype.x) or \
+        np.isnan(sometype.y) or \
+        np.isnan(sometype.z)
+  # PointStamed
+  if type(sometype) == geometry_msgs.PointStamped:
+    return np.isnan(sometype.point.x) or \
+        np.isnan(sometype.point.y) or \
+        np.isnan(sometype.point.z)
+  # Point32
+  if (type(sometype) == geometry_msgs.Point32):
+    return np.isnan(sometype.x) or \
+        np.isnan(sometype.y) or \
+        np.isnan(sometype.z)
+  # Quaternion
+  if type(sometype) == geometry_msgs.Quaternion:
+    return np.isnan(sometype.x) or \
+        np.isnan(sometype.y) or \
+        np.isnan(sometype.z) or \
+        np.isnan(sometype.w)
+  # QuaternionStamped
+  if type(sometype) == geometry_msgs.QuaternionStamped:
+    return np.isnan(sometype.quaternion.x) or \
+        np.isnan(sometype.quaternion.y) or \
+        np.isnan(sometype.quaternion.z) or \
+        np.isnan(sometype.quaternion.w)
+  # Transform
+  if type(sometype) == geometry_msgs.Transform:
+    return is_nan(sometype.translation) or is_nan(sometype.rotation);
+  # TransformStamped
+  if type(sometype) == geometry_msgs.TransformStamped:
+    return is_nan(sometype.transform.translation) or is_nan(sometype.transform.rotation);
+  # Vector3
+  if type(sometype) == geometry_msgs.Vector3:
+    return np.isnan(sometype.x) or \
+        np.isnan(sometype.y) or \
+        np.isnan(sometype.z)
+  # Vector3Stamped
+  if type(sometype) == geometry_msgs.Vector3Stamped:
+    return np.isnan(sometype.vector.x) or \
+        np.isnan(sometype.vector.y) or \
+        np.isnan(sometype.vector.z)
+  # kdl Frame
+  if (type(sometype) == kdl.Frame):
+    return np.isnan(sometype.p) or np.isnan(sometype.M)
+  # kdl Vector
+  if (type(sometype) == kdl.Vector):
+    return np.isnan(sometype.x()) or \
+        np.isnan(sometype.y()) or \
+        np.isnan(sometype.z())
+  # kdl Rotation
+  if (type(sometype) == kdl.Rotation):
+    (x,y,z,w) = sometype.GetQuaternion()
+    return np.isnan(x) or \
+        np.isnan(y) or \
+        np.isnan(z) or \
+        np.isnan(w)
+  # iterable
+  if hasattr(sometype, '__iter__'):
+    for a in sometype:
+      if is_nan(a): #recur
+        return True
+    return False
+
+  raise Exception(rospy.get_name() + ':' + __name__ + ': unable to test:\n%s\nfor nan' % (str(sometype)));
+
+
+def to_Vector3(*args, **kwargs):
+  ''' 
+    converts the input to a geometry_msgs/Vector3 message
+    
+    supported input:
+      - ROS Pose message (orientation ignored)
+      - ROS PoseStamped message (orientation ignored)
+      - ROS Point message
+      - ROS PointStamped message
+      - ROS Point32 message
+      - ROS Transform message (orientation ignored)
+      - ROS TransformStamped message (orientation ignored)
+      - ROS Vector3 message
+      - ROS Vector3Stamped message
+      - kdl Frame (orientation ignored)
+      - kdl Vector
+      - tf transform (orientation ignored)
+      - iterable of length 3 (list, tuple, np.array, ...)
+      - individual x,y,z values
+      - named x, y, z arguments.  (minimum of 1 can be specified)
+      - no arguments will result in the zero point
+
+    keyword args:
+      - x, y, z
+
+    Note: if more than 1 argument then they should be in the order they appear
+  '''
+
+  # None passed in
+  if (len(args) == 1 and args[0] == None):
+    return geometry_msgs.Vector3(0,0,0);
+  
+  if len(args) == 1:
+    # Pose
+    if type(args[0]) == geometry_msgs.Pose:
+      position = args[0].position;
+      return geometry_msgs.Vector3(position.x, position.y, position.z);
+    # PoseStamped
+    if type(args[0]) == geometry_msgs.PoseStamped:
+      position = args[0].pose.position;
+      return geometry_msgs.Vector3(position.x, position.y, position.z);
+    # Point
+    if type(args[0]) == geometry_msgs.Point:
+      return geometry_msgs.Vector3(args[0].x, args[0].y, args[0].z);
+    # PointStamed
+    if type(args[0]) == geometry_msgs.PointStamped:
+      return geometry_msgs.Vector3(args[0].point.x, args[0].point.y, args[0].point.z);
+    # Point32
+    if (type(args[0]) == geometry_msgs.Point32):
+      return geometry_msgs.Vector3(args[0].x, args[0].y, args[0].z);
+    # Transform
+    if type(args[0]) == geometry_msgs.Transform:
+      return geometry_msgs.Vector3(args[0].translation.x, 
+                                   args[0].translation.y,
+                                   args[0].translation.z);
+    # TransformStamped
+    if type(args[0]) == geometry_msgs.TransformStamped:
+      return geometry_msgs.Vector3(args[0].transform.translation.x, 
+                                   args[0].transform.translation.y,
+                                   args[0].transform.translation.z);
+    # Vector3
+    if type(args[0]) == geometry_msgs.Vector3:
+      return copy.deepcopy(args[0]);
+    # Vector3Stamped
+    if type(args[0]) == geometry_msgs.Vector3Stamped:
+      return copy.deepcopy(args[0].vector);
+    # kdl Frame
+    if (type(args[0]) == kdl.Frame):
+      return geometry_msgs.Vector3(args[0].p.x(), args[0].p.y(), args[0].p.z());
+    # kdl Vector
+    if (type(args[0]) == kdl.Vector):
+      return geometry_msgs.Vector3(args[0].x(), args[0].y(), args[0].z());
+    # 4x4 numpy array
+    if (type(args[0]) == np.ndarray and args[0].shape == (4,4)):
+      return geometry_msgs.Vector3(args[0][0,3], args[0][1,3], args[0][2,3]);
+    # tf transform ((x,y,z), (x,y,z,w))
+    if (hasattr(args[0], '__iter__') and len(args[0]) == 2 and len(args[0][0]) == 3):
+      return geometry_msgs.Vector3(*args[0][0][:3]); 
+    # iterable length 3
+    if (hasattr(args[0], '__iter__') and len(args[0]) >= 3):
+      return geometry_msgs.Vector3(*args[0][:3]);
+
+  # 3 arguments
+  elif len(args) == 3:
+    return geometry_msgs.Vector3(*args);
+  
+  # x, y, or z keyword arguments
+  elif ('x' in kwargs or 'y' in kwargs or 'z' in kwargs):
+    x=0
+    y=0
+    z=0
+    if 'x' in kwargs:
+      x=kwargs['x']
+    if 'y' in kwargs:
+      y=kwargs['y']
+    if 'z' in kwargs:
+      z=kwargs['z']
+    return geometry_msgs.Vector3(x, y, z)
+
+  # no arguments
+  elif (len(args) == 0):
+    return geometry_msgs.Vector3(0,0,0)
+  
+  raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\n%s\nto ros Vector3 message' % (args, kwargs));
+
+def to_Vector3Stamped(*args, **kwargs):
+  ''' 
+    converts the input to a geometry_msgs/Vector3Stamped message
+
+    supported input:
+      - ROS Pose message (orientation ignored)
+      - ROS PoseStamped message (orientation ignored)
+      - ROS Point message
+      - ROS PointStamped message
+      - ROS Point32 message
+      - ROS Transform message (orientation ignored)
+      - ROS TransformStamped message (orientation ignored)
+      - ROS Vector3 message
+      - ROS Vector3Stamped message
+      - kdl Frame (orientation ignored)
+      - kdl Vector
+      - tf transform (orientation ignored)
+      - iterable of length 3 (list, tuple, np.array, ...)
+      - individual x,y,z values
+      - named x, y, z arguments.  (minimum of 1 can be specified)
+      - no arguments will result in the zero point
+
+    keyword args:
+      - frame_id 
+      - stamp
+      - x, y, z
+
+    'frame_id' and 'stamp' logic:
+     1. If frame_id or stamp are specified as keywords, they will be used, 
+        otherwise,
+     2. if the passed in argument is a *Stamped type, the frame_id and stamp
+        will be taked from that, otherwise,
+     3. the rospy.BASE_FRAME and 0 time stamp will be used.
+    
+    Note: if more than 1 argument then they should be in the order they appear
+  '''
+  
+  # get point
+  v3s = geometry_msgs.Vector3Stamped();
+  try:
+    v3s.vector = to_Vector3(*args, **kwargs);
+  except:
+    raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\n%s\nto ros Vector3Stamped message' % (args, kwargs));
+  
+  # override frame_id if specified
+  if 'frame_id' in kwargs.keys():
+    v3s.header.frame_id = kwargs['frame_id'];
+  # else, use existing frame_id if passed in a *Stamped message
+  elif ( (len(args) == 1 and args[0] != None) and 
+         (type(args[0]) == geometry_msgs.PoseStamped or
+          type(args[0]) == geometry_msgs.PointStamped or
+          type(args[0]) == geometry_msgs.TransformStamped or 
+          type(args[0]) == geometry_msgs.Vector3Stamped) ):
+    v3s.header.frame_id = args[0].header.frame_id
+  # else, use the base_frame
+  else:
+    v3s.header.frame_id = BASE_FRAME;
+  
+  # override stamp if specified
+  if 'stamp' in kwargs.keys():
+    v3s.header.stamp = kwargs['stamp'];
+  # else, use existing stamp if passed in a *Stamped message
+  elif ( (len(args) == 1 and args[0] != None) and 
+         (type(args[0]) == geometry_msgs.PoseStamped or
+          type(args[0]) == geometry_msgs.PointStamped or
+          type(args[0]) == geometry_msgs.TransformStamped or 
+          type(args[0]) == geometry_msgs.Vector3Stamped) ):
+    v3s.header.stamp = args[0].header.stamp 
+  # else, use a 0 time stamp
+  else:
+    v3s.header.stamp = rospy.Time();
+  
+  return v3s;
+
+  
+def to_Point(*args, **kwargs):
+  ''' 
+    converts the input to a geometry_msgs/Point message
+    
+    supported input:
+      - ROS Pose message (orientation ignored)
+      - ROS PoseStamped message (orientation ignored)
+      - ROS Point message
+      - ROS PointStamped message
+      - ROS Point32 message
+      - ROS Transform message (orientation ignored)
+      - ROS TransformStamped message (orientation ignored)
+      - ROS Vector3 message
+      - ROS Vector3Stamped message
+      - kdl Frame (orientation ignored)
+      - kdl Vector
+      - tf transform (orientation ignored)
+      - iterable of length 3 (list, tuple, np.array, ...)
+      - individual x,y,z values
+      - named x, y, z arguments.  (minimum of 1 can be specified)
+      - no arguments will result in the zero point
+
+    keyword args:
+      - x, y, z
+
+    Note: if more than 1 argument then they should be in the order they appear
+  '''
+
+  # None passed in
+  if (len(args) == 1 and args[0] == None):
+    return geometry_msgs.Point(0,0,0);
+  
+  if len(args) == 1:
+    # Pose
+    if type(args[0]) == geometry_msgs.Pose:
+      return copy.deepcopy(args[0].position);
+    # PoseStamped
+    if type(args[0]) == geometry_msgs.PoseStamped:
+      return copy.deepcopy(args[0].pose.position);
+    # Point
+    if type(args[0]) == geometry_msgs.Point:
+      return copy.deepcopy(args[0]);
+    # PointStamed
+    if type(args[0]) == geometry_msgs.PointStamped:
+      return copy.deepcopy(args[0].point);
+    # Point32
+    if (type(args[0]) == geometry_msgs.Point32):
+      return geometry_msgs.Point(args[0].x, args[0].y, args[0].z);
+    # Transform
+    if type(args[0]) == geometry_msgs.Transform:
+      return geometry_msgs.Point(args[0].translation.x, 
+                                 args[0].translation.y,
+                                 args[0].translation.z);
+    # TransformStamped
+    if type(args[0]) == geometry_msgs.TransformStamped:
+      return geometry_msgs.Point(args[0].transform.translation.x, 
+                                 args[0].transform.translation.y,
+                                 args[0].transform.translation.z);
+    # Vector3
+    if type(args[0]) == geometry_msgs.Vector3:
+      return geometry_msgs.Point(args[0].x, args[0].y, args[0].z);
+    # Vector3Stamped
+    if type(args[0]) == geometry_msgs.Vector3Stamped:
+      return geometry_msgs.Point(args[0].vector.x, args[0].vector.y, args[0].vector.z);
+    # kdl Frame
+    if (type(args[0]) == kdl.Frame):
+      return geometry_msgs.Point(args[0].p.x(), args[0].p.y(), args[0].p.z());
+    # kdl Vector
+    if (type(args[0]) == kdl.Vector):
+      return geometry_msgs.Point(args[0].x(), args[0].y(), args[0].z());
+    # 4x4 numpy array
+    if (type(args[0]) == np.ndarray and args[0].shape == (4,4)):
+      return geometry_msgs.Point(args[0][0,3], args[0][1,3], args[0][2,3]);
+    # tf transform ((x,y,z), (x,y,z,w))
+    if (hasattr(args[0], '__iter__') and len(args[0]) == 2 and len(args[0][0]) == 3):
+      return geometry_msgs.Point(*args[0][0][:3]); 
+    # iterable length 3
+    if (hasattr(args[0], '__iter__') and len(args[0]) >= 3):
+      return geometry_msgs.Point(*args[0][:3]);
+
+  # 3 arguments
+  elif len(args) == 3:
+    return geometry_msgs.Point(*args);
+  
+  # x, y, or z keyword arguments
+  elif ('x' in kwargs or 'y' in kwargs or 'z' in kwargs):
+    x=0
+    y=0
+    z=0
+    if 'x' in kwargs:
+      x=kwargs['x']
+    if 'y' in kwargs:
+      y=kwargs['y']
+    if 'z' in kwargs:
+      z=kwargs['z']
+    return geometry_msgs.Point(x, y, z)
+
+  # no arguments
+  elif (len(args) == 0):
+    return geometry_msgs.Point(0,0,0)
+  
+  raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\n%s\nto ros Point message' % (args, kwargs));
+
+def to_Point32(*args, **kwargs):
+  ''' 
+    converts the input to a geometry_msgs/Point32 message
+    
+    supported input:
+      - ROS Pose message (orientation ignored)
+      - ROS PoseStamped message (orientation ignored)
+      - ROS Point message
+      - ROS PointStamped message
+      - ROS Point32 message
+      - ROS Transform message (orientation ignored)
+      - ROS TransformStamped message (orientation ignored)
+      - ROS Vector3 message
+      - ROS Vector3Stamped message
+      - kdl Frame (orientation ignored)
+      - kdl Vector
+      - tf transform (orientation ignored)
+      - iterable of length 3 (list, tuple, np.array, ...)
+      - individual x,y,z values
+      - named x, y, z arguments.  (minimum of 1 can be specified)
+      - no arguments will result in the zero point
+
+    keyword args:
+      - x, y, z
+
+    Note: if more than 1 argument then they should be in the order they appear
+  '''
+  # get Point
+  try:
+    point = to_Point(*args, **kwargs)
+  except:
+    raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\n%s\nto ros Point32 message' % (args, kwargs));
+  
+  return geometry_msgs.Point32(point.x, point.y, point.z)
+
+
+def to_PointStamped(*args, **kwargs):
+  ''' 
+    converts the input to a geometry_msgs/PointStamped message
+
+    supported input:
+      - ROS Pose message (orientation ignored)
+      - ROS PoseStamped message (orientation ignored)
+      - ROS Point message
+      - ROS PointStamped message
+      - ROS Point32 message
+      - ROS Transform message (orientation ignored)
+      - ROS TransformStamped message (orientation ignored)
+      - ROS Vector3 message
+      - ROS Vector3Stamped message
+      - kdl Frame (orientation ignored)
+      - kdl Vector
+      - tf transform (orientation ignored)
+      - iterable of length 3 (list, tuple, np.array, ...)
+      - individual x,y,z values
+      - named x, y, z arguments.  (minimum of 1 can be specified)
+      - no arguments will result in the zero point
+
+    keyword args:
+      - frame_id 
+      - stamp
+      - x, y, z
+
+    'frame_id' and 'stamp' logic:
+     1. If frame_id or stamp are specified as keywords, they will be used, 
+        otherwise,
+     2. if the passed in argument is a *Stamped type, the frame_id and stamp
+        will be taked from that, otherwise,
+     3. the rospy.BASE_FRAME and 0 time stamp will be used.
+    
+    Note: if more than 1 argument then they should be in the order they appear
+  '''
+  
+  # get point
+  pts = geometry_msgs.PointStamped();
+  try:
+    pts.point = to_Point(*args, **kwargs);
+  except:
+    raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\n%s\nto ros PointStamped message' % (args, kwargs));
+  
+  # override frame_id if specified
+  if 'frame_id' in kwargs.keys():
+    pts.header.frame_id = kwargs['frame_id'];
+  # else, use existing frame_id if passed in a *Stamped message
+  elif ( (len(args) == 1 and args[0] != None) and 
+         (type(args[0]) == geometry_msgs.PoseStamped or
+          type(args[0]) == geometry_msgs.PointStamped or
+          type(args[0]) == geometry_msgs.TransformStamped or 
+          type(args[0]) == geometry_msgs.Vector3Stamped) ):
+    pts.header.frame_id = args[0].header.frame_id
+  # else, use the base_frame
+  else:
+    pts.header.frame_id = BASE_FRAME;
+  
+  # override stamp if specified
+  if 'stamp' in kwargs.keys():
+    pts.header.stamp = kwargs['stamp'];
+  # else, use existing stamp if passed in a *Stamped message
+  elif ( (len(args) == 1 and args[0] != None) and 
+         (type(args[0]) == geometry_msgs.PoseStamped or
+          type(args[0]) == geometry_msgs.PointStamped or
+          type(args[0]) == geometry_msgs.TransformStamped or 
+          type(args[0]) == geometry_msgs.Vector3Stamped) ):
+    pts.header.stamp = args[0].header.stamp 
+  # else, use a 0 time stamp
+  else:
+    pts.header.stamp = rospy.Time();
+  
+  return pts;
+
+
+def to_Quaternion(*args, **kwargs):
+  ''' 
+    converts the input to a geometry_msgs/Quaternion message
+    
+    supported input:
+      - ROS Pose message (position ignored)
+      - ROS PoseStamped message (position ignored)
+      - ROS Transform message (position ignored)
+      - ROS TransformStamped message (position ignored)
+      - ROS Quaternion message
+      - ROS QuaternionStamped message
+      - kdl Frame (position ignored)
+      - kdl Rotation
+      - tf transform (position ignored)
+      - iterable of length 4 (list, tuple, np.array, ...) (x, y, z, w)
+      - a 3x3 or 4x4 numpy array
+      - individual x, y, z, w values
+      - named x, y, z, w arguments.  (minimum of 1 can be specified)
+      - no arguments will result in an identity rotation
+
+    keyword args:
+      - x, y, z
+
+    Note: if more than 1 argument then they should be in the order they appear
+  '''
+
+  # None passed in
+  if (len(args) == 1 and args[0] == None):
+    return geometry_msgs.Quaternion(0,0,0,1);
+  
+  if len(args) == 1:
+    # Quaternion
+    if type(args[0]) == geometry_msgs.Quaternion:
+      return copy.deepcopy(args[0]);    
+    # QuaternionStamped
+    if type(args[0]) == geometry_msgs.QuaternionStamped:
+      return copy.deepcopy(args[0].quaternion);
+    # Pose
+    if type(args[0]) == geometry_msgs.Pose:
+      return copy.deepcopy(args[0].orientation);
+    # PoseStamped
+    if type(args[0]) == geometry_msgs.PoseStamped:
+      return copy.deepcopy(args[0].pose.orientation);
+    # Transform
+    if type(args[0]) == geometry_msgs.Transform:
+      return copy.deepcopy(args[0].rotation);
+    # TransformStamped
+    if type(args[0]) == geometry_msgs.TransformStamped:
+      return copy.deepcopy(args[0].transform.rotation);
+    # kdl Frame
+    if (type(args[0]) == kdl.Frame):
+      return geometry_msgs.Quaternion(*args[0].M.GetQuaternion())
+    # kdl Rotation
+    if (type(args[0]) == kdl.Rotation):
+      return geometry_msgs.Quaternion(*args[0].GetQuaternion())
+    
+    # 3x3 or 4x4 numpy array
+    if (type(args[0]) == np.ndarray and args[0].ndim == 2):
+      (r, c) = args[0].shape
+      if (r >= 3 and c >= 3):
+        rot = kdl.Rotation(args[0][0,0], args[0][0,1], args[0][0,2],
+                           args[0][1,0], args[0][1,1], args[0][1,2],
+                           args[0][2,0], args[0][2,1], args[0][2,2])
+        return geometry_msgs.Quaternion(*rot.GetQuaternion())
+      
+    # tf transform ((x,y,z), (x,y,z,w))
+    if (hasattr(args[0], '__iter__') and len(args[0]) == 2 and len(args[0][1]) == 4):
+      return geometry_msgs.Quaternion(*args[0][1][:4]);
+    # iterable length 4
+    if (hasattr(args[0], '__iter__') and len(args[0]) >= 4):
+      return geometry_msgs.Quaternion(*args[0][:4]);
+
+  # 4 arguments
+  elif len(args) == 4:
+    return geometry_msgs.Quaternion(*args);
+  
+  # x, y, z, or w keyword arguments
+  elif ('x' in kwargs or 'y' in kwargs or 'z' in kwargs or 'w' in kwargs):
+    x=0
+    y=0
+    z=0
+    w=0
+    if 'x' in kwargs:
+      x=kwargs['x']
+    if 'y' in kwargs:
+      y=kwargs['y']
+    if 'z' in kwargs:
+      z=kwargs['z']
+    if 'w' in kwargs:
+      w=kwargs['w']
+    return geometry_msgs.Quaternion(x, y, z, w)
+
+  # no arguments
+  elif (len(args) == 0):
+    return geometry_msgs.Quaternion(0,0,0,1)
+  
+  raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\n%s\nto ros Quaternion message' % (args, kwargs));
+
+
+def to_Pose(*args):
+  ''' 
+    converts the input to a geometry_msgs/Pose message
+    
+    supported input:
+      * single argument:
+         - ROS Pose message
+         - ROS PoseStamped message
+         - ROS Transform message
+         - ROS TransformStamped message
+         - kdl frame
+         - tf transform
+         - numpy 4x4 transform matrix
+         - anything to_Point() takes. (Will create a Pose with the specified 
+           point and an identity rotation.  May generate warnings.)
+         - anything to_Quaternion() takes. (Will create a Pose with a zero
+           point and the specified rotation.  May generate warnings.)
+      * two arguments:
+         - first argument: anything to_Point() takes
+         - second argument: anything to_Quaternion() takes
+      * no arguments will result in the identity pose
+
+    Note: if more than 1 argument then they should be in the order they appear
+    Note: array form of quaternion is assumed to be (x, y, z, w)
+  '''
+  if len(args) == 0:
+    return geometry_msgs.Pose(geometry_msgs.Point(0,0,0), geometry_msgs.Quaternion(0,0,0,1));
+
+  elif len(args) == 1:
+    
+    point = None
+    quat = None
+    try:
+      point = to_Point(args[0])
+    except:
+      pass
+    
+    try:
+      quat = to_Quaternion(args[0])
+    except:
+      pass
+    
+    # error if both fail
+    if (point == None and quat == None):
+      raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\nto ros Pose message' % (args));
+    
+    # clean up individual types
+    if point == None:
+      point = geometry_msgs.Point(0,0,0)
+    if quat == None:
+      quat = geometry_msgs.Quaternion(0,0,0,1)
+      
+    # return pose
+    return geometry_msgs.Pose(point, quat)
+
+  elif len(args) == 2:
+
+    point = None
+    quat = None
+
+    try:
+      point = to_Point(args[0])
+    except:
+      pass
+    
+    try:
+      quat = to_Quaternion(args[1])
+    except:
+      pass
+    
+    if point == None or quat == None:
+      raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\nto ros Pose message' % (args));
+    
+    return geometry_msgs.Pose(point, quat)
+  
+  raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\nto ros Pose message' % (args));
+
+
+def to_PoseStamped(*args, **kwargs):
+  ''' 
+    converts the input to a geometry_msgs/PoseStamped message
+
+    supported input:
+      * single argument:
+         - ROS Pose message
+         - ROS PoseStamped message
+         - ROS Transform message
+         - ROS TransformStamped message
+         - kdl frame
+         - tf transform
+         - numpy 4x4 transform matrix
+         - anything to_Point() takes. (Will create a Pose with the specified 
+           point and an identity rotation.  May generate warnings.)
+         - anything to_Quaternion() takes. (Will create a Pose with a zero
+           point and the specified rotation.  May generate warnings.)
+      * two arguments:
+         - first argument: anything to_Point() takes
+         - second argument: anything to_Quaternion() takes
+      * no arguments will result in the identity pose
+
+    keyword args:
+      - frame_id 
+      - stamp
+
+    'frame_id' and 'stamp' logic:
+     1. If frame_id or stamp are specified as keywords, they will be used, 
+        otherwise,
+     2. if the first passed in argument is a *Stamped type, the frame_id and stamp
+        will be taked from that, otherwise,
+     3. if the second passed in argument is a *Stamped type, the frame_id and stamp
+        will be taked from that, otherwise,
+     4. the rospy.BASE_FRAME and 0 time stamp will be used.
+
+    Note: if more than 1 argument then they should be in the order they appear
+    Note: array form of quaternion is assumed to be (x, y, z, w)
+  '''
+
+  # get pose
+  ps = geometry_msgs.PoseStamped();
+  try:
+    ps.pose = to_Pose(*args);
+  except:
+    raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\n%s\nto ros PoseStamped message' % (args, kwargs));
+
+  # override frame_id if specified
+  if 'frame_id' in kwargs.keys():
+    ps.header.frame_id = kwargs['frame_id'];
+  # else, use existing frame_id if passed in a *Stamped message as argument 1
+  elif ( (len(args) >= 1 and args[0] != None) and 
+         (type(args[0]) == geometry_msgs.PoseStamped or
+          type(args[0]) == geometry_msgs.PointStamped or
+          type(args[0]) == geometry_msgs.QuaternionStamped or
+          type(args[0]) == geometry_msgs.TransformStamped or 
+          type(args[0]) == geometry_msgs.Vector3Stamped) ):
+    ps.header.frame_id = args[0].header.frame_id
+  # else, use existing frame_id if passed in a *Stamped message as argument 2
+  elif ( (len(args) >= 2 and args[1] != None) and 
+         (type(args[1]) == geometry_msgs.PoseStamped or
+          type(args[1]) == geometry_msgs.QuaternionStamped or
+          type(args[1]) == geometry_msgs.TransformStamped) ):
+    ps.header.frame_id = args[1].header.frame_id
+  # else, use the base_frame
+  else:
+    ps.header.frame_id = BASE_FRAME;
+  
+  # override stamp if specified
+  if 'stamp' in kwargs.keys():
+    ps.header.stamp = kwargs['stamp'];
+  elif ( (len(args) >= 1 and args[0] != None) and 
+         (type(args[0]) == geometry_msgs.PoseStamped or
+          type(args[0]) == geometry_msgs.PointStamped or
+          type(args[0]) == geometry_msgs.QuaternionStamped or
+          type(args[0]) == geometry_msgs.TransformStamped or 
+          type(args[0]) == geometry_msgs.Vector3Stamped) ):
+    ps.header.stamp = args[0].header.stamp 
+  # else, use existing stamp if passed in a *Stamped message as argument 2
+  elif ( (len(args) >= 2 and args[1] != None) and 
+         (type(args[1]) == geometry_msgs.PoseStamped or
+          type(args[1]) == geometry_msgs.QuaternionStamped or
+          type(args[1]) == geometry_msgs.TransformStamped) ):
+    ps.header.stamp = args[1].header.stamp
+  # else, use a 0 time stamp
+  else:
+    ps.header.stamp = rospy.Time();
+
+  return ps;
+
+
+def to_PointCloud(*args, **kwargs):
+  ''' 
+    converts the input to a sensor_msgs/PointCloud message
+
+    supported input:
+      - ROS PointCloud messages
+      - iterable of ROS Point messages
+      - iterable of kdl Vectors
+      - iterable of iterables
+      - numpy array Nx3 or 3xN (if N == 3 then it is assumed Nx3)
+      - no arguments will result in an empty PointCloud
+
+    keyword args:
+      - frame_id 
+      - stamp
+
+    NOTE: mixing types is not supported
+  '''
+  if len(args) > 0 and type(args[0]) == sensor_msgs.PointCloud:
+    return copy.deepcopy(args[0]);
+  
+  pc = sensor_msgs.PointCloud();
+  if len(args) > 0:
+    pts = args[0];
+    # numpy array
+    if type(pts) == np.ndarray:
+      # 3xN (N > 3)
+      if (max(pts.shape) > 3 and pts.shape[1] > pts.shape[0]):
+        pts = pts.T;
+      # Nx3 or 3xN (N < 3)
+      elif (pts.shape != (3,3) and pts.shape[0] == 3):
+        pts = pts.T;
+      pc.points = map(lambda p: geometry_msgs.Point32(p[0], p[1], p[2]), pts);
+
+    elif (hasattr(pts, '__iter__') and len(args[0]) > 0):
+      # Point32
+      if type(pts[0]) == geometry_msgs.Point32:
+        pc.points = copy.deepcopy(pts); 
+      # Point
+      elif type(pts[0]) == geometry_msgs.Point:
+        pc.points = map(lambda p: geometry_msgs.Point32(p.x, p.y, p.z), pts);
+      # kdl Vector
+      elif type(pts[0]) == kdl.Vector:
+        pc.points = map(lambda p: geometry_msgs.Point32(p.x(), p.y(), p.z()), pts);
+      # iterable
+      elif hasattr(pts[0], '__iter__'):
+        pc.points = map(lambda p: geometry_msgs.Point32(p[0], p[1], p[2]), pts);
+
+
+  if 'frame_id' in kwargs.keys():
+    pc.header.frame_id = kwargs['frame_id'];
+  else:
+    pc.header.frame_id = BASE_FRAME;
+
+  if 'stamp' in kwargs.keys():
+    pc.header.stamp = kwargs['stamp'];
+  else:
+    pc.header.stamp = rospy.Time();
+
+  return pc; 
+
+
+def header(stamp=rospy.Time(), frame_id=BASE_FRAME):
+  ''' creates a ros header '''
+  return rospy.Header(seq=0, stamp=stamp, frame_id=frame_id);
+
+
+def to_array(*args):
+  ''' 
+    converts the input to numpy array format
+
+    supported input:
+      - ROS PointCloud message
+      - ROS Pose/Stamped message
+      - ROS Quaternion/Stamped message
+      - ROS Point/Stamped message
+      - ROS Vector3/Stamped message
+      - ROS Image message (returned in RGB format)
+      - kdl frame
+      - kdl Rotation
+      - kdl Vector
+      - pr_msgs.Joints
+      - pr_msgs.JointTraj
+      - iterable 
+
+    NOTE: point clouds are returned as Nx3 arrays
+    NOTE: Poses and Rotations will be returned in 4x4 matrix format 
+  '''
+  # numpy array
+  if len(args) > 0 and type(args[0]) == np.ndarray:
+    return args[0].copy();
+
+  # PointCloud
+  elif type(args[0]) == sensor_msgs.PointCloud:
+    return np.array(map(lambda p: (p.x, p.y, p.z), args[0].points));
+  # PoseStamped
+  elif type(args[0]) == geometry_msgs.PoseStamped:
+    return tr.rospose2tr(args[0].pose);
+  # Pose
+  elif type(args[0]) == geometry_msgs.Pose:
+    return tr.rospose2tr(args[0]);
+  # QuaternionStamped
+  elif type(args[0]) == geometry_msgs.QuaternionStamped:
+    return tr.rosq2rot(args[0].quaternion);
+  # Quaternion
+  elif type(args[0]) == geometry_msgs.Quaternion:
+    return tr.rosq2rot(args[0]);
+  # Vector3Stamped
+  elif type(args[0]) == geometry_msgs.Vector3Stamped:
+    return np.array([args[0].vector.x, args[0].vector.y, args[0].vector.z]);
+  # Vector3
+  elif type(args[0]) == geometry_msgs.Vector3:
+    return np.array([args[0].x, args[0].y, args[0].z]);
+  # PointStamped
+  elif type(args[0]) == geometry_msgs.PointStamped:
+    return np.array([args[0].point.x, args[0].point.y, args[0].point.z]);
+  # Point
+  elif (type(args[0]) == geometry_msgs.Point
+      or type(args[0]) == geometry_msgs.Point32):
+    return np.array([args[0].x, args[0].y, args[0].z]);
+  # ROS Image
+  elif (type(args[0]) == sensor_msgs.Image):
+    bridge = cv_bridge.CvBridge();
+    cvimg = bridge.imgmsg_to_cv(args[0]);
+    return np.asarray(cvimg);
+  # kdl Frame
+  elif type(args[0]) == kdl.Frame:
+    return tr.kdlf2tr(args[0]);
+  # kdl Rotation
+  elif type(args[0]) == kdl.Rotation:
+    return tr.kdlr2tr(args[0]);
+  # kdl Vector
+  elif type(args[0]) == kdl.Vector:
+    return np.array([args[0].x(), args[0].y(), args[0].z()]);
+  # pr_msgs.Joints
+  elif type(args[0]) == pr_msgs.Joints:
+    return np.array(args[0].j);
+  # pr_msgs.JointTraj
+  elif type(args[0]) == pr_msgs.JointTraj:
+    return np.array(map(lambda jp: jp.j, args[0].positions));
+  # Perception_msgs.BlobStamped
+  elif type(args[0]) == Perception_msgs.BlobStamped:
+    return np.array(map(lambda p: [p.x, p.y, p.z], args[0].points));
+  # iterable
+  elif hasattr(args[0], '__iter__'):
+    # array of pr_msgs.Joints
+    if (len(args[0]) > 0 and type(args[0][0]) == pr_msgs.Joints):
+      return np.array(map(lambda jp: jp.j, args[0]));
+    if (len(args[0]) > 0 
+          and type(args[0][0]) == geometry_msgs.Point or type(args[0][0]) == geometry_msgs.Point32):
+      return np.array(map(lambda p: [p.x, p.y, p.z], args[0]));
+    else:
+      return np.array(args[0]);
+  else:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': type not recognized: %s' % type(args[0]));
+    return None
+
+
+def to_KDLFrame(*args):
+  try:
+    p = to_Pose(*args)
+  except:
+    raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\nto kdl Frame' % (args));
+  
+  kdlR = kdl.Rotation.Quaternion(p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w)
+  kdlT = kdl.Vector(p.position.x, p.position.y, p.position.z);
+  return kdl.Frame(kdlR, kdlT)
+
+def to_KDLVector(*args):
+  try:
+    v = to_Vector3(*args)
+  except:
+    raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\nto kdl Vector' % (args));
+  return kdl.Vector(v.x, v.y, v.z)
+
+def to_KDLRotation(*args):
+  try:
+    r = to_Quaternion(*args)
+  except:
+    raise Exception(rospy.get_name() + ':' + __name__ + ': unable to convert:\n%s\nto kdl Rotation' % (args));
+  return kdl.Rotation.Quaternion(r.x, r.y, r.z, r.w)
+
+
+##########################################
+
+
+def transformPoint(target_frame, ps, waitTimeout=0.1):
+  '''
+    wrapper around tf.listener.transformPoint
+
+    If the transform fails due to timing the most current transform is used
+  '''
+  global listener
+  try:
+    listener.waitForTransform(target_frame, ps.header.frame_id, ps.header.stamp, rospy.Duration(waitTimeout))
+    return listener.transformPoint(target_frame, ps); 
+  except (tf.Exception, tf.ExtrapolationException), ex:
+    # transform failed, use most current transform
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': unable to transform point: %s' % ex);
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': proceeding with most recent transform');
+    ps = copy.deepcopy(ps);
+    ps.header.stamp = rospy.Time();
+    return listener.transformPoint(target_frame, ps);
+
+
+def transformVector3(target_frame, v3s, waitTimeout=0.1):
+  '''
+    wrapper around tf.listener.transformVector3
+
+    If the transform fails due to timing the most current transform is used
+  '''
+  global listener
+  try:
+    listener.waitForTransform(target_frame, v3s.header.frame_id, v3s.header.stamp, rospy.Duration(waitTimeout))
+    return listener.transformVector3(target_frame, v3s); 
+  except (tf.Exception, tf.ExtrapolationException), ex:
+    # transform failed, use most current transform
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': unable to transform vector3: %s' % ex);
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': proceeding with most recent transform');
+    v3s= copy.deepcopy(v3s);
+    v3s.header.stamp = rospy.Time();
+    return listener.transformVector3(target_frame, v3s);
+
+
+def transformQuaternion(target_frame, qs, waitTimeout=0.1):
+  '''
+    wrapper around tf.listener.transformQuaternion
+
+    If the transform fails due to timing the most current transform is used
+  '''
+  global listener
+  try:
+    listener.waitForTransform(target_frame, qs.header.frame_id, qs.header.stamp, rospy.Duration(waitTimeout))
+    return listener.transformQuaternion(target_frame, qs); 
+  except (tf.Exception, tf.ExtrapolationException), ex:
+    # transform failed, use most current transform
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': unable to transform quaternion: %s' % ex);
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': proceeding with most recent transform');
+    qs = copy.deepcopy(qs);
+    qs.header.stamp = rospy.Time();
+    return listener.transformQuaternion(target_frame, qs);
+
+
+def transformPose(target_frame, ps, waitTimeout=0.1):
+  '''
+    wrapper around tf.listener.transformPose
+
+    If the transform fails due to timing the most current transform is used
+  '''
+  global listener
+  try:
+    listener.waitForTransform(target_frame, ps.header.frame_id, ps.header.stamp, rospy.Duration(waitTimeout))
+    return listener.transformPose(target_frame, ps); 
+  except (tf.Exception, tf.ExtrapolationException), ex:
+    # transform failed, use most current transform
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': unable to transform pose: %s' % ex);
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': proceeding with most recent transform');
+    ps = copy.deepcopy(ps);
+    ps.header.stamp = rospy.Time();
+    return listener.transformPose(target_frame, ps);
+
+
+def transformPointCloud(target_frame, point_cloud, waitTimeout=0.1):
+  '''
+    wrapper around tf.listener.transformPointCloud
+
+    If the transform fails due to timing the most current transform is used
+  '''
+  global listener
+  try:
+    listener.waitForTransform(target_frame, point_cloud.header.frame_id, point_cloud.header.stamp, rospy.Duration(waitTimeout))
+    return listener.transformPointCloud(target_frame, point_cloud); 
+  except (tf.Exception, tf.ExtrapolationException), ex:
+    # transform failed, use most current transform
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': unable to transform point cloud: %s' % ex);
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': proceeding with most recent transform');
+    point_cloud = copy.deepcopy(point_cloud);
+    point_cloud.header.stamp = rospy.Time();
+    return listener.transformPointCloud(target_frame, point_cloud);
+
+
+def lookupTransform(dstFrame, srcFrame, stamp=rospy.Time(), waitTimeout=0.1):
+  ''' returns the 4x4 transform for the given frames '''
+  global listener
+  try:
+    listener.waitForTransform(dstFrame, srcFrame, stamp, rospy.Duration(waitTimeout))
+    (t,q) = listener.lookupTransform(dstFrame, srcFrame, stamp);
+  except (tf.Exception, tf.ExtrapolationException), ex:
+    # transform failed, use most current transform
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': unable to get transform : %s' % ex);
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': proceeding with most recent transform');
+    (t,q) = listener.lookupTransform(dstFrame, srcFrame, rospy.Time());
+
+  return np.dot(tr.trans(t), tr.rosq2rot(q));
+
+
+def get_frame_id(obj):
+  ''' 
+    returns the frame id for the input
+
+    if the object has no frame_id field or the frame_id == ''
+      then the BASE_FRAME is returned
+  '''
+  if hasattr(obj, 'header'):
+    return obj.header.frame_id if obj.header.frame_id != '' else BASE_FRAME; 
+  elif hasattr(obj, 'frame_id'):
+    return obj.frame_id if obj.frame_id != '' else BASE_FRAME; 
+  else:
+    return BASE_FRAME;
+
+
+def load_obj_scan(filename):
+  ''' 
+    loads a .obj file 
+    
+    returns numpy arrays for the vertices, normals and faces 
+  '''
+
+  vertices = [];
+  textures = [];
+  normals = [];
+  faces = [];
+
+  fh = open(filename, 'r');
+
+
+  for line in fh:
+    line = line.strip().split();
+    if line:
+      if line[0] == 'v':
+        # vertex
+        vertices.append(map(float, line[1:]));
+      elif line[0] == 'vt':
+        # textures 
+        textures.append(map(float, line[1:]));
+      elif line[0] == 'vn':
+        # normal
+        normals.append(map(float, line[1:]));
+      elif line[0] == 'f':
+        # face
+        # extract vertex, texture, normal indices
+        ls = map(lambda s: np.fromstring(s, dtype='i', sep='/') -1, line[1:]);
+        faces.append(np.transpose(np.array(ls)));
+ 
+  # convert to numpy
+  v = np.array(vertices);
+  vt = np.array(textures);
+  vn = np.array(normals);
+  f  = faces;
+
+  return (v, vt, vn, f);
+
+
+def format_obj_file(v, vt, vn, f, name=None, origScanLocation=None):
+  ''' 
+    formats the .obj file from the array format
+    returns the string
+  '''
+  s =  '#####\n';
+  s +=  '#\n';
+  if (name != None):
+    s +=  '# model for: %s\n' % name;
+    s +=  '#\n';
+  if (origScanLocation != None):
+    s += '# original model file %s\n' % origScanLocation;
+    s +=  '#\n';
+  s +=  '# generated %s\n' % time.strftime('%Y-%m-%d');
+  s +=  '#\n';
+  s += '#####\n';
+  s += '\n';
+  s += '\n';
+
+  for vert in v:
+    s += 'v %f %f %f\n' % (vert[0], vert[1], vert[2]);
+  s += '\n';
+
+  for tex in vt:
+    s += 'vt %f %f %f\n' % (tex[0], tex[1], tex[2]);
+  s += '\n';
+
+  for norm in vn:
+    s += 'vn %f %f %f\n' % (norm[0], norm[1], norm[2]);
+  s += '\n';
+
+  for face in f:
+    s += 'f ';
+    ivert = face[0]+1;
+    itex = face[1]+1 if len(face) > 1 else [-1, -1, -1];
+    inorm = face[2]+1 if len(face) > 2 else [-1, -1, -1];
+    s += '%s/%s/%s ' % (ivert[0], (itex[0] if itex[0] > -1 else ''), (inorm[0] if inorm[0] > -1 else ''));
+    s += '%s/%s/%s ' % (ivert[1], (itex[1] if itex[1] > -1 else ''), (inorm[1] if inorm[1] > -1 else ''));
+    s += '%s/%s/%s\n' % (ivert[2], (itex[2] if itex[2] > -1 else ''), (inorm[2] if inorm[2] > -1 else ''));
+  s += '\n';
+  s += '\n';
+  
+  return s;
+
+
+
+
+if __name__ == '__main__':
+  
+  print "RosUtil unit tests"
+  
+  rospy.init_node("RosUtil_unit_test", anonymous=True, log_level=rospy.DEBUG)
+  init_utils()
+  
+  test_toPoint = False
+  test_toPoint32 = False
+  test_toPointStamped = False
+  test_toQuaternion = False
+  test_toQuaternionStamped = False
+  test_toPose = False
+  test_toPoseStamped = True
+  
+
+  print "starting tests"
+  
+  ros_pose = geometry_msgs.Pose()
+  ros_pose.position.x = 1
+  ros_pose.position.y = 2
+  ros_pose.position.z = 3
+  ros_pose.orientation.x = 1
+  ros_pose.orientation.y = 2
+  ros_pose.orientation.z = 3
+  ros_pose.orientation.w = 4
+  
+  ros_pose_stamped = geometry_msgs.PoseStamped()
+  ros_pose_stamped.header.stamp = rospy.Time.now()
+  ros_pose_stamped.header.frame_id = 'foo'
+  ros_pose_stamped.pose = copy.deepcopy(ros_pose)
+  
+  ros_point = geometry_msgs.Point()
+  ros_point.x = 4
+  ros_point.y = 5
+  ros_point.z = 6
+
+  ros_point_stamped = geometry_msgs.PointStamped()
+  ros_point_stamped.header.stamp = rospy.Time.now()
+  ros_point_stamped.header.frame_id = 'foo'
+  ros_point_stamped.point.x = 4
+  ros_point_stamped.point.y = 5
+  ros_point_stamped.point.z = 6  
+
+  ros_point32 = geometry_msgs.Point32(7,8,9)
+
+  ros_quaternion = geometry_msgs.Quaternion(4,5,6,7)
+  
+  ros_transform = geometry_msgs.Transform()
+  ros_transform.translation.x = 6
+  ros_transform.translation.y = 7
+  ros_transform.translation.z = 8
+  ros_transform.rotation.x = 9
+  ros_transform.rotation.y = 0
+  ros_transform.rotation.z = 1
+  ros_transform.rotation.w = 2
+  
+  ros_transform_stamped = geometry_msgs.TransformStamped()
+  ros_transform_stamped.child_frame_id = 'bar'
+  ros_transform_stamped.header.stamp = rospy.Time.now()
+  ros_transform_stamped.header.frame_id = "foo"
+  ros_transform_stamped.transform.translation.x = 7
+  ros_transform_stamped.transform.translation.y = 8
+  ros_transform_stamped.transform.translation.z = 9
+  ros_transform_stamped.transform.rotation.x = 0
+  ros_transform_stamped.transform.rotation.y = 1
+  ros_transform_stamped.transform.rotation.z = 2
+  ros_transform_stamped.transform.rotation.w = 3
+
+  ros_vector3 = geometry_msgs.Vector3()
+  ros_vector3.x = 3
+  ros_vector3.y = 4
+  ros_vector3.z = 5
+
+  ros_vector3_stamped = geometry_msgs.Vector3Stamped()
+  ros_vector3_stamped.vector.x = 4
+  ros_vector3_stamped.vector.y = 5
+  ros_vector3_stamped.vector.z = 6
+
+  kdl_frame = kdl.Frame(kdl.Rotation.Quaternion(3,4,5,1), kdl.Vector(2, 3, 4))
+  kdl_vector = kdl.Vector(3, 4, 5)
+  kdl_rotation = kdl.Rotation.Quaternion(2,3,4,1)
+  
+  tf_transform = ((5,6,7), (8,9,0,1))
+  tf_vector = (6,7,8)
+  tf_rotation = (9, 0, 1, 2)
+  
+  np_vec3 = np.array([8, 9, 1])
+  np_vec4 = np.array([2, 3, 4, 5])
+
+  np_vec3x3 = np.array([[2, 3, 4],
+                        [1, 2, 3],
+                        [2, 2, 1]])
+  
+  np_vec4x4 = np.array([[2, 3, 4, 5],
+                        [6, 7, 8, 9],
+                        [0, 1, 2, 3],
+                        [2, 3, 4, 5]])
+  
+  ros_wrench = geometry_msgs.Wrench()
+  ros_wrench.force.x = 1
+  ros_wrench.force.y = 2
+  ros_wrench.force.z = 3
+  ros_wrench.torque.x = 4
+  ros_wrench.torque.y = 5
+  ros_wrench.torque.z = 6
+
+  if test_toPoint:
+      print "========================"
+      print "=      to_Point()      ="
+      print "========================"
+      print "\nzero:"
+      print to_Point()
+      print "\nnone:"
+      print to_Point(None)
+      print "\nros pose:"
+      print to_Point(ros_pose)
+      print "\nros pose stamped:"
+      print to_Point(ros_pose_stamped)
+      print "\nros point:"
+      print to_Point(ros_point)
+      print "\nros point stamped:"
+      print to_Point(ros_point_stamped)
+      print "\nros point32:"
+      print to_Point(ros_point32)
+      print "\nros transform:"
+      print to_Point(ros_transform)
+      print "\nros transform stamped:"
+      print to_Point(ros_transform_stamped)
+      print "\nros vector3:"
+      print to_Point(ros_vector3)
+      print "\nros vector3 stamped:"
+      print to_Point(ros_vector3_stamped)
+      print "\nkdl frame:"
+      print to_Point(kdl_frame)
+      print "\nkdl vector:"
+      print to_Point(kdl_vector)
+      print "\ntf transform:"
+      print to_Point(tf_transform)
+      print "\ntf vector:"
+      print to_Point(tf_vector)
+      print "\nnp array:"
+      print to_Point(np_vec3)
+      print "\n3 params:"
+      print to_Point(1,2,3)
+      print "\nx y z args:"
+      print to_Point(x=1,y=2,z=3)
+      print "\nros wrench (error):"
+      try:
+        print to_Point(ros_wrench)
+      except Exception as e:
+        print e
+      print ""
+
+  if test_toPoint32:
+      print "========================"
+      print "=     to_Point32()     ="
+      print "========================"
+      print "\nzero:"
+      print to_Point32()
+      print "\nnone:"
+      print to_Point32(None)
+      print "\nros pose:"
+      print to_Point32(ros_pose)
+      print "\nros pose stamped:"
+      print to_Point32(ros_pose_stamped)
+      print "\nros point:"
+      print to_Point32(ros_point)
+      print "\nros point stamped:"
+      print to_Point32(ros_point_stamped)
+      print "\nros point32:"
+      print to_Point32(ros_point32)
+      print "\nros transform:"
+      print to_Point32(ros_transform)
+      print "\nros transform stamped:"
+      print to_Point32(ros_transform_stamped)
+      print "\nros vector3:"
+      print to_Point32(ros_vector3)
+      print "\nros vector3 stamped:"
+      print to_Point32(ros_vector3_stamped)
+      print "\nkdl frame:"
+      print to_Point32(kdl_frame)
+      print "\nkdl vector:"
+      print to_Point32(kdl_vector)
+      print "\ntf transform:"
+      print to_Point32(tf_transform)
+      print "\ntf vector:"
+      print to_Point32(tf_vector)
+      print "\nnp array:"
+      print to_Point32(np_vec3)
+      print "\n3 params:"
+      print to_Point32(1,2,3)
+      print "\nx y z args:"
+      print to_Point32(x=1,y=2,z=3)
+      print "\nros wrench (error):"
+      try:
+        print to_Point32(ros_wrench)
+      except Exception as e:
+        print e
+      print ""
+
+  if test_toPointStamped:
+      print "========================"
+      print "=   to_PointStamped()  ="
+      print "========================"
+      print "\nzero:"
+      print to_PointStamped()
+      print "\nnone:"
+      print to_PointStamped(None)
+      print "\nros pose:"
+      print to_PointStamped(ros_pose)
+      print "\nros pose with stamp:"
+      print to_PointStamped(ros_pose, stamp=rospy.Time(5))
+      print "\nros pose with frame_id:"
+      print to_PointStamped(ros_pose, frame_id='xxx')
+      print "\nros pose stamped:"
+      print to_PointStamped(ros_pose_stamped)
+      print "\nros point:"
+      print to_PointStamped(ros_point)
+      print "\nros point stamped:"
+      print to_PointStamped(ros_point_stamped)
+      print "\nros point32:"
+      print to_PointStamped(ros_point32)
+      print "\nros transform:"
+      print to_PointStamped(ros_transform)
+      print "\nros transform stamped:"
+      print to_PointStamped(ros_transform_stamped)
+      print "\nros vector3:"
+      print to_PointStamped(ros_vector3)
+      print "\nros vector3 stamped:"
+      print to_PointStamped(ros_vector3_stamped)
+      print "\nkdl frame:"
+      print to_PointStamped(kdl_frame)
+      print "\nkdl vector:"
+      print to_PointStamped(kdl_vector)
+      print "\ntf transform:"
+      print to_PointStamped(tf_transform)
+      print "\ntf vector:"
+      print to_PointStamped(tf_vector)
+      print "\nnp array:"
+      print to_PointStamped(np_vec3)
+      print "\n3 params:"
+      print to_PointStamped(1,2,3)
+      print "\nx y z args:"
+      print to_PointStamped(x=1,y=2,z=3)
+      print "\nros wrench (error):"
+      try:
+        print to_PointStamped(ros_wrench, frame_id='blue')
+      except Exception as e:
+        print e
+      print ""
+
+  if test_toQuaternion:
+      print "========================"
+      print "=   to_Quaternion()    ="
+      print "========================"
+      print "\nzero:"
+      print to_Quaternion()
+      print "\nnone:"
+      print to_Quaternion(None)
+      print "\nros pose:"
+      print to_Quaternion(ros_pose)
+      print "\nros pose stamped:"
+      print to_Quaternion(ros_pose_stamped)
+      print "\nros transform:"
+      print to_Quaternion(ros_transform)
+      print "\nros transform stamped:"
+      print to_Quaternion(ros_transform_stamped)
+      print "\nkdl frame:"
+      print to_Quaternion(kdl_frame)
+      print "\nkdl rotation:"
+      print to_Quaternion(kdl_rotation)
+      print "\ntf transform:"
+      print to_Quaternion(tf_transform)
+      print "\ntf rotation:"
+      print to_Quaternion(tf_rotation)
+      print "\nnp array 4:"
+      print to_Quaternion(np_vec4)
+      print "\nnp array 3x3:"
+      print to_Quaternion(np_vec3x3)
+      print "\nnp array 4x4:"
+      print to_Quaternion(np_vec4x4)
+      print "\n4 params:"
+      print to_Quaternion(1,2,3,4)
+      print "\nx y w args:"
+      print to_Quaternion(x=1,y=2,w=3)
+      print "\nros wrench (error):"
+      try:
+        print to_Quaternion(ros_wrench)
+      except Exception as e:
+        print e
+      print ""
+
+  if test_toQuaternionStamped:
+    raise Exception("to_QuaternionStamped() is not written yet")
+
+  if test_toPose:
+      print "========================"
+      print "=      to_Pose()       ="
+      print "========================"
+      print "\nzero:"
+      print to_Pose()
+      print "\nnone:"
+      print to_Pose(None)
+      print "\nnone none:"
+      print to_Pose(None, None)
+      print "\nros pose:"
+      print to_Pose(ros_pose)
+      print "\nros pose stamped:"
+      print to_Pose(ros_pose_stamped)
+      print "\nros transform:"
+      print to_Pose(ros_transform)
+      print "\nros transform stamped:"
+      print to_Pose(ros_transform_stamped)
+      print "\nkdl frame:"
+      print to_Pose(kdl_frame)
+      print "\ntf transform:"
+      print to_Pose(tf_transform)
+      print "\nnp array 4x4:"
+      print to_Pose(np_vec4x4)
+      print "\nros wrench (error):"
+      try:
+        print to_Pose(ros_wrench)
+      except Exception as e:
+        print e
+      print ""
+      print "----"
+      print ""
+      print "\nros point, ros quaternion:"
+      print to_Pose(ros_point, ros_quaternion)
+      print "\nkdl vector, kdl rotation:"
+      print to_Pose(kdl_vector, kdl_rotation)
+      print "\nros point, kdl rotation:"
+      print to_Pose(ros_point, kdl_rotation)
+      print "\nnone, kdl rotation:"
+      print to_Pose(None, kdl_rotation)
+      print "\nkdl vector, none:"
+      print to_Pose(kdl_vector, None)
+      print "\nnp array 4x4 array 4x4:"
+      print to_Pose(np_vec4x4, np_vec4x4)
+      print "\nros point:"
+      print to_Pose(ros_point)
+      print "\nros quaternion:"
+      print to_Pose(ros_quaternion)
+
+    
+  if test_toPoseStamped:
+      print "========================"
+      print "=   to_PoseStamped()   ="
+      print "========================"
+      print "\nzero:"
+      print to_PoseStamped()
+      print "\nnone:"
+      print to_PoseStamped(None)
+      print "\nnone none:"
+      print to_PoseStamped(None, None)
+      print "\nros pose:"
+      print to_PoseStamped(ros_pose)
+      print "\nros pose stamped:"
+      print to_PoseStamped(ros_pose_stamped)
+      print "\nros pose stamped with frame_id:"
+      print to_PoseStamped(ros_pose_stamped, frame_id='xxx')
+      print "\nros pose stamped with stamp:"
+      print to_PoseStamped(ros_pose_stamped, stamp=rospy.Time(2))
+      print "\nros transform:"
+      print to_PoseStamped(ros_transform)
+      print "\nros transform stamped:"
+      print to_PoseStamped(ros_transform_stamped)
+      print "\nkdl frame:"
+      print to_PoseStamped(kdl_frame)
+      print "\ntf transform:"
+      print to_PoseStamped(tf_transform)
+      print "\nnp array 4x4:"
+      print to_PoseStamped(np_vec4x4)
+      print "\nros wrench (error):"
+      try:
+        print to_PoseStamped(ros_wrench)
+      except Exception as e:
+        print e
+      print ""
+      print "----"
+      print ""
+      print "\nros point, ros quaternion:"
+      print to_PoseStamped(ros_point, ros_quaternion)
+      print "\nros point, ros pose_stamped:"
+      print to_PoseStamped(ros_point, ros_pose_stamped)
+      print "\nros point, ros quaternion with frame_id:"
+      print to_PoseStamped(ros_point, ros_quaternion, frame_id="yyy")
+      print "\nkdl vector, kdl rotation:"
+      print to_PoseStamped(kdl_vector, kdl_rotation)
+      print "\nros point, kdl rotation:"
+      print to_PoseStamped(ros_point, kdl_rotation)
+      print "\nros point_stamped, kdl rotation:"
+      print to_PoseStamped(ros_point_stamped, kdl_rotation)
+      print "\nnone, kdl rotation:"
+      print to_PoseStamped(None, kdl_rotation)
+      print "\nkdl vector, none:"
+      print to_PoseStamped(kdl_vector, None)
+      print "\nnp array 4x4 array 4x4:"
+      print to_PoseStamped(np_vec4x4, np_vec4x4)
+      print "\nros point:"
+      print to_PoseStamped(ros_point)
+      print "\nros point_stamped:"
+      print to_PoseStamped(ros_point_stamped)
+      print "\nros quaternion:"
+      print to_PoseStamped(ros_quaternion)
+
+    

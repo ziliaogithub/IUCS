@@ -1,0 +1,417 @@
+import os
+import io
+import sys 
+import time 
+import copy 
+import math 
+import string 
+import numpy as np 
+import scipy as sp
+
+import roslib; roslib.load_manifest('scripting_util');
+import rospy
+
+import std_msgs.msg as std_msgs
+import sensor_msgs.msg as sensor_msgs
+import geometry_msgs.msg as geometry_msgs
+
+import object_model_msgs.msg as object_model_msgs
+import Perception_msgs_upenn.msg as Perception_msgs
+
+import std_srvs.srv as std_srvs
+import object_model_msgs.srv as object_model_srvs
+import novel_grasping_msgs.srv as novel_grasping_srvs
+import Perception_msgs_upenn.srv as Perception_srvs
+
+import RosUtil as ru
+import Transform as tr
+import PointCloudUtil as pcu
+
+# cache n models
+objScanCacheSize = 3;
+cachedObjScans = {};
+
+## setup services 
+ResolveGrasps = ru.service_proxy('/object_model/resolve_grasps', object_model_srvs.ResolveGrasps, not ru.is_sim());
+GetMass = ru.service_proxy('/object_model/get_mass', object_model_srvs.GetMass, not ru.is_sim());
+GetObjFileLocation = ru.service_proxy('/object_model/get_obj_file_location', object_model_srvs.GetObjFileLocation, not ru.is_sim());
+GetObjScan = ru.service_proxy('/object_model/get_obj_scan', object_model_srvs.GetObjScan, not ru.is_sim());
+GetObjScan2 = ru.service_proxy('/object_model/get_obj_scan2', object_model_srvs.GetObjScan2, not ru.is_sim());
+GetCollision = ru.service_proxy('/object_model/get_collision', object_model_srvs.GetCollision, not ru.is_sim());
+ReloadDatabase = ru.service_proxy('/object_model/reload_database', std_srvs.Empty, not ru.is_sim());
+RefinePose = ru.service_proxy('/pose_refiner/refine_pose', object_model_srvs.RefinePose, False);
+ReloadRefiners = ru.service_proxy('/pose_refiner/reload_database', std_srvs.Empty, False);
+ProcessNovelModel = ru.service_proxy('/novel_model_processor/process_novel_model', object_model_srvs.ProcessNovelModel, False);
+GenerateGrasps = ru.service_proxy('/novel_grasping/generate_grasps', novel_grasping_srvs.GenerateGrasps, False);
+GenerateGraspYaml = ru.service_proxy('/novel_grasping/generate_grasp_yaml', novel_grasping_srvs.GenerateGraspYaml, False);
+
+
+def resolve_grasps(objName, objPose, action='grasp'):
+  ''' gets list of grasp poses for given object pose and action '''
+  objPose.header.stamp = rospy.Time();
+
+  rospy.loginfo(__name__ + ": resolving %s grasps for %s" % (objName, action))
+  try:
+    resp = ResolveGrasps(name=objName,
+                          action=action,
+                          objPose=ru.to_PoseStamped(objPose));
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': resolve_grasps serivce falied: %s' % err);
+    return [];
+
+  return resp.grasps;
+
+
+def get_obj_file_location(name, resolution='hires'):
+  ''' returns the obj model file location '''
+  try:
+    resp = GetObjFileLocation(name=name, resolution=resolution);
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': get_obj_file_locaion serivce falied: %s' % err);
+    return '';
+
+  return resp.location;
+
+def get_pc_model(name, pose=None, resolution='lores'):
+
+  # is the request point cloud cached
+  k = (name, resolution, sensor_msgs.PointCloud);
+  if (k in cachedObjScans.keys()):
+    pts = cachedObjScans[k].copy(); 
+  else:
+    req = object_model_srvs.GetObjScanRequest();
+    req.name = name;
+    req.resolution = resolution;
+    req.include_faces = False;
+    try:
+      resp = GetObjScan(req);
+    except rospy.ServiceException as err:
+      rospy.logerr(__name__ + ': get_obj_scan serivce falied: %s' % err);
+      return np.array([]);
+    pts = ru.to_array(resp.vertices);
+
+    if len(cachedObjScans) == objScanCacheSize:
+      # remove the oldest cached scan
+      cachedObjScans.popitem();
+    # add new cloud to the cache
+    if (len(pts) > 0):
+      cachedObjScans[k] = pts.copy();
+
+  if name == 'right_angle_drill':
+    tip = np.array([-0.182, -0.172, 0])
+    pts = np.append(pts, tip)
+    pts = pts.reshape((-1,3))
+   
+  # is empty?
+  if (pts.shape[0] == 0):
+    return pts;
+
+
+  if pose != None:
+    # transform points based on pose
+    ps = ru.to_PoseStamped(pose);
+    ps_wrtBase = ru.transformPose(ru.BASE_FRAME, ps);
+    T = tr.rospose2tr(ps_wrtBase.pose);
+    pts = np.vstack((pts.T, np.ones(pts.shape[0])));
+    pts = np.dot(T, pts);
+    return pts[:3,:].T;
+  else:
+    return pts;
+
+
+def get_model(name, pose=None, resolution='lores'):
+  return get_pc_model(name, pose, resolution=resolution);
+
+
+def get_collision(name, pose=None, prefix=''):
+  ''' wrapper of the object_model get_collision service call.
+  returns a tuple of (spheres list, cylinders list)'''
+  
+  req = object_model_srvs.GetCollisionRequest();
+  req.name = name;
+  req.pose_stamped = ru.to_PoseStamped(pose);
+  req.prefix = prefix;
+  try:
+    resp = GetCollision(req);
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': get_collision serivce falied: %s' % err);
+    return ([], []);
+  
+  return (resp.spheres, resp.cylinders);
+
+  
+def get_min_collision_point(name, pose=None):
+  '''
+  Get the collision model for the named object with given pose. 
+  Then compute the minimum point in the Z axis of the pose frame.
+  returns a geometry_msgs.PointStamped, or None on error.
+  '''
+  
+  req = object_model_srvs.GetCollisionRequest();
+  req.name = name;
+  req.pose_stamped = ru.to_PoseStamped(pose);
+  req.prefix = ''
+  try:
+    resp = GetCollision(req);
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': get_collision serivce falied: %s' % err);
+    return None
+  
+  minpoint = ru.to_PointStamped(pose);
+  
+  for sphere in resp.spheres:
+    if sphere.point.z - sphere.radius < minpoint.point.z:
+      minpoint.point.x = sphere.point.x
+      minpoint.point.y = sphere.point.y
+      minpoint.point.z = sphere.point.z - sphere.radius
+      
+  for cylinder in resp.cylinders:
+    for point in cylinder.points:
+      if point.z - cylinder.radius < minpoint.point.z:
+        minpoint.point.x = point.x
+        minpoint.point.y = point.y
+        minpoint.point.z = point.z - cylinder.radius
+  
+  return minpoint
+  
+
+def get_mass(name):
+  ''' returns the mass of the object in kg '''
+  req = object_model_srvs.GetMassRequest();
+  req.name = name; 
+  try:
+    resp = GetMass(req);
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': get_mass serivce falied: %s' % err);
+    return 0.0;
+
+  return resp.mass;
+
+def refine_pose(objName, objPose, action, tableHeight):
+  '''
+    wrapper for the refine_pose service call
+    refines a pose based on the obj/task prior knowledge
+  '''
+  rospy.loginfo(__name__ + ': refining %s pose for %s' % (objName, action));
+  try:
+    resp = RefinePose(name=objName,
+                      action=action,
+                      tableHeight=tableHeight,
+                      poseStamped=ru.to_PoseStamped(objPose));
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': refine_pose serivce falied: %s' % err);
+    return ru.to_PoseStamped(objPose);
+
+  return resp.poseStamped;
+
+
+
+def refine_generic_pose(objName, objPose, vertThres=25.0*math.pi/180.0, horzThres=25.0*math.pi/180.0, tableHeight=0.0):
+  '''
+    'refines' an object candidate based on the object pose
+    the purpose of this is to get rid of small pose errors using the table as a prior 
+
+    return refined pose stamped of the object in the BASE_FRAME
+  '''
+  # get the obj pose in the base frame
+  ps = ru.to_PoseStamped(objPose);
+  pose = ru.transformPose(ru.BASE_FRAME, ps).pose;
+
+  # angle from XY plane
+  R = tr.rosq2rot(pose.orientation);
+  x = np.array([1, 0, 0, 1]);
+  y = np.array([0, 1, 0, 1]);
+  z = np.array([0, 0, 1, 1]);
+
+  xo = np.dot(R, x);
+  angleFromXY = np.pi/2.0 - np.abs(ru.angle_between(xo[:3], z[:3]));
+
+
+  if (np.abs(angleFromXY) > vertThres):
+    # near vertical orientation
+
+    # x axis pointing up/down
+    xn = np.sign(angleFromXY)*np.array([0,0,1]);
+
+    # y pointing along the projection of y on the xy plane
+    yo = np.dot(R, np.array([0, 1, 0, 1]));
+    yn = yo[:3] - np.dot(yo[:3], z[:3]) * z[:3];
+    yn /= np.linalg.norm(yn);
+
+    # z is the cross of x and y
+    zn = np.cross(xn, yn);
+
+    # set new object orientation 
+    pose.orientation = tr.rot2rosq(tr.ev2rot(xn, yn, zn));
+
+
+  elif (np.abs(angleFromXY) < horzThres):
+    # near horitzontal orientation
+
+    # x pointing along the projection of x on the xy plane
+    xo = np.dot(R, x);
+    xn = xo[:3] - np.dot(xo[:3], z[:3]) * z[:3];
+    xn /= np.linalg.norm(xn);
+
+    # y or z vertical
+    yo = np.dot(R, y);
+    zo = np.dot(R, z);
+    if (np.abs(yo[2]) > np.abs(zo[2])):
+      # y vertical
+      yn = np.array([0, 0, 1]) if yo[2] > 0 else np.array([0, 0, -1]);
+         
+      # z is cross of x and y
+      zn = np.cross(xn, yn);
+      
+    else:
+      # z vertical
+      zn = np.array([0, 0, 1]) if zo[2] > 0 else np.array([0, 0, -1]);
+
+      # y is cross of z and x
+      yn = np.cross(zn, xn);
+
+    # set new object pose
+    pose.orientation = tr.rot2rosq(tr.ev2rot(xn, yn, zn));
+
+  else:
+    # leave it alone, it is probably proped up on something
+    pass;
+
+  # adjust the object centroid based on the table height
+  # the min point on the model should be at the table height
+  # (i.e. the object cannot be floating in the air)
+  model = get_pc_model(objName, pose=pose);
+  minz = np.min(model[:,2]); 
+  diff = tableHeight - minz;
+  pose.position.z += diff;
+
+  return ru.to_PoseStamped(pose, frame_id=ru.BASE_FRAME);
+
+def refine_height(objName, pose, tableHeight):
+  # adjust the object centroid based on the table height
+  # the min point on the model should be at the table height
+  # (i.e. the object cannot be floating in the air)
+  ps = ru.transformPose(ru.BASE_FRAME, ru.to_PoseStamped(pose));
+  model = get_pc_model(objName, pose=ps);
+  minz = np.min(model[:,2]); 
+  diff = tableHeight - minz;
+  ps.pose.position.z += diff;
+
+  return ps;
+ 
+
+def compare_bbox_size(model, blobPts, blobPose=None):
+  ''' compares the bounding box of the blob with the model '''
+  blob = ru.to_array(blobPts);
+  if (type(model) == str):
+    model = get_model(model);
+  else:
+    model = ru.to_array(model);
+
+  if blobPose == None:
+    blobPose = pcu.get_blob_pose(blob);
+
+  blobBBox = pcu.get_bbox(blob, blobPose);
+  modelBBox = pcu.get_bbox(model);
+  blobBBoxSize = blobBBox[:,1] - blobBBox[:,0];
+  modelBBoxSize = modelBBox[:,1] - modelBBox[:,0];
+
+  return np.log(blobBBoxSize / modelBBoxSize);
+
+def rank_blobs_by_bbox(name, blobs):
+  ''' 
+    ranks the list of blobs by comparing the bounding boxes to the model
+    blobs: either list of Object, BlobStamped or BlobsStamped msg
+  '''
+  if (type(blobs) == Perception_msgs.BlobsStamped):
+    blobs = blobs.blobs;
+  elif (type(blobs) == Perception_msgs.ObjectDetection):
+    blobs = blobs.candidates;
+  if (hasattr(blobs, '__iter__')):
+    if (type(blobs[0]) == Perception_msgs.Object):
+      objs = blobs;
+      poses = map(lambda o: o.pose, objs); 
+      blobs = map(lambda o: o.blob, objs); 
+    else:
+      poses = map(lambda b: pcu.get_blob_pose(b.points), blobs);
+
+  
+  # compute aligned bboxes
+  model = get_model(name);
+  bboxCmp = map(lambda i: compare_bbox_size(model, blobs[i].points, poses[i]), np.arange(len(blobs)));
+  errSum = map(lambda bb: np.sum(np.abs(bb)), bboxCmp);
+
+  return np.argsort(errSum);
+  
+def process_novel_model(name, origScanLocation, outScanLocRelative, mass, useBaseProperties=False, trainTemplates=False, generateGraspYaml=False):
+  ''' novel model service interface '''
+  try:
+    resp = ProcessNovelModel( name = name,
+                              orig_scan_location = origScanLocation, 
+                              out_scan_loc_relative = outScanLocRelative, 
+                              use_base_properties = useBaseProperties,
+                              train_templates = trainTemplates,
+                              generate_grasp_yaml = generateGraspYaml);
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': process_novel_model serivce falied: %s' % err);
+    return False;
+    
+  if resp.success:
+    return True;
+  else:
+    rospy.logerr(__name__ + ': process_novel_model serivce falied: %s' % resp.reason);
+
+def generate_grasps(objPS, objPts, topRes=np.deg2rad(45/2.0), sideRes=np.deg2rad(45/2.0), qualityBinning=8):
+  ''' novel grasping service interface for creating grasps list '''
+  try:
+    resp = GenerateGrasps(obj_ps = ru.to_PoseStamped(objPS), 
+                          obj_pts = ru.to_PointCloud(objPts),
+                          top_res = topRes,
+                          side_res = sideRes,
+                          quality_binning = qualityBinning);
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': generate_grasps serivce falied: %s' % err);
+    return [];
+    
+  return resp.grasps;
+
+def generate_grasp_yaml(modelPts, topRes=np.deg2rad(45/2.0), sideRes=np.deg2rad(45/2.0), qualityBinning=4):
+  ''' novel grasping service interface for creating the grasp yaml definitions '''
+  try:
+    resp = GenerateGraspYaml( obj_pts = ru.to_PointCloud(modelPts),
+                              top_res = topRes,
+                              side_res = sideRes,
+                              quality_binning = qualityBinning);
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': generate_grasp_yaml serivce falied: %s' % err);
+    return '[]';
+
+  return resp.grasp_yaml;
+
+
+def reload_database():
+  ''' reloads the object model database '''
+  try:
+    resp = ReloadDatabase();
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': object model reload_database serivce falied: %s' % err);
+    return False;
+
+  return True;
+
+
+def reload_refiners():
+  ''' reloads the pose refiners database '''
+  try:
+    resp = ReloadRefiners();
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': pose refiners reload_database serivce falied: %s' % err);
+    return False;
+
+  return True;
+
+
+def cleanup():
+  ''' this is designed to be called on preempts '''
+  pass;
+

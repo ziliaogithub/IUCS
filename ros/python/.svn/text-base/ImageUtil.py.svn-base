@@ -1,0 +1,294 @@
+import sys
+import time
+import math
+import copy 
+import string
+import numpy as np
+import scipy as sp
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+import tf
+import cv
+import cv_bridge
+import PyKDL as kdl
+
+import std_msgs.msg as std_msgs
+import geometry_msgs.msg as geometry_msgs
+import sensor_msgs.msg as sensor_msgs
+
+import Perception_msgs_upenn.msg as Perception_msgs 
+
+import RosUtil as ru
+
+cameraFrame = { 'bbl':'/DarmSim/BumbleBee2LeftEyeLink',
+                'bbr':'/DarmSim/BumbleBee2RightEyeLink',
+                'sr':'/DarmSim/SR4000Link',
+                'pro':'/DarmSim/ProsilicaLink'}
+
+## load calibration
+pathToCalibration = '/home/arm_user/test/sensor_calib';
+if '/calibration_location' in rospy.get_param_names():
+  pathToCalibration = rospy.get_param('/calibration_location');
+else:
+  rospy.logwarn(__name__ + ': /calibration_location rosparam not set. Using default path: %s' % pathToCalibration);
+
+# append / to path if needed
+if pathToCalibration[-1] != '/':
+  pathToCalibration += '/';
+
+rospy.loginfo('ImageUtil: loading sensor calibration from: %s' % pathToCalibration);
+try:
+  bbExtrinsicRotation = cv.Load(pathToCalibration + 'bbExtrinsicRotation.xml');
+  bbExtrinsicTranslation = cv.Load(pathToCalibration + 'bbExtrinsicTranslation.xml');
+  bbLeftDistCoeffs = cv.Load(pathToCalibration + 'bbLeftDistCoeffs.xml');
+  bbLeftIntrinsics = cv.Load(pathToCalibration + 'bbLeftIntrinsics.xml');
+  bbLeftWrtArm = cv.Load(pathToCalibration + 'bbLeftWrtArm.xml');
+  bbRightDistCoeffs = cv.Load(pathToCalibration + 'bbRightDistCoeffs.xml');
+  bbRightIntrinsics = cv.Load(pathToCalibration + 'bbRightIntrinsics.xml');
+  lowerTilt = cv.Load(pathToCalibration + 'lowerTilt.xml');
+  #prosilicaDistCoeffs = cv.Load(pathToCalibration + 'prosilicaDistCoeffs.xml');
+  #prosilicaIntrinsics = cv.Load(pathToCalibration + 'prosilicaIntrinsics.xml');
+  #proWrtBBExtrinsicRotation = cv.Load(pathToCalibration + 'proWrtBBExtrinsicRotation.xml');
+  #proWrtBBExtrinsicTranslation = cv.Load(pathToCalibration + 'proWrtBBExtrinsicTranslation.xml');
+  srWrtArm = cv.Load(pathToCalibration + 'srWrtArm.xml');
+  upperTilt = cv.Load(pathToCalibration + 'upperTilt.xml');
+except Exception as ex:
+  rospy.logfatal(__name__ + ': unable to load calibration files at: %s.  Error: %s' % (pathToCalibration, ex));
+  sys.exit();
+
+
+def str2color(color):
+  c = string.lower(color);
+  if c == 'red' or c == 'r':
+    return cv.Scalar(255, 0, 0);
+  if c == 'green' or c == 'g':
+    return cv.Scalar(0, 255, 0);
+  if c == 'blue' or c == 'b':
+    return cv.Scalar(0, 0, 255);
+  if c == 'white' or c == 'w':
+    return cv.Scalar(255, 255, 255);
+  if c == 'black' or c == 'k':
+    return cv.Scalar(0, 0, 0);
+
+def msg2array(image):
+  im = msg2cvmat(image);
+  a = np.asarray(im);
+  # convert to rgb
+  return a[:,:,::-1];
+
+
+def msg2cvmat(image):
+  ''' converts a ros Image msg to cv image '''
+  bridge = cv_bridge.CvBridge();
+  return bridge.imgmsg_to_cv(image, 'bgr8');
+
+def point2cvmat(point, dataType=cv.CV_32FC1):
+  ''' makes a CvMat from the given point msg '''
+  p = cv.CreateMat(1, 3, dataType);
+  p[0,0] = point.x;
+  p[0,1] = point.y;
+  p[0,2] = point.z;
+  return p;
+
+def array2cvmat(arr, allowND=False):
+  ''' makes a CvMat from the given array of points '''
+  return cv.fromarray(arr, allowND);
+
+def cvmat2array(mat):
+  ''' makes a CvMat from the given array of points '''
+  return np.asarray(mat);
+
+def pose2cvmat(pose, dataType=cv.CV_32FC1):
+  ''' makes a CvMat from the given pose msg '''
+  p = cv.CreateMat(1, 3, dataType);
+  p[0,0] = pose.position.x;
+  p[0,1] = pose.position.y;
+  p[0,2] = pose.position.z;
+  o = cv.CreateMat(1, 4, dataType);
+  o[0,0] = pose.orientation.x;
+  o[0,1] = pose.orientation.y;
+  o[0,2] = pose.orientation.z;
+  o[0,3] = pose.orientation.w;
+  return (p, o);
+
+
+def project_points(points, camera='bbl'):
+  ''' 
+    projects the 3D point into the desired image coordinates 
+    points should be a Nx3 CvMat 
+  '''
+  N = points.rows;
+
+  # the 3D points should be in the camera frame so no extrinsic rot/trans extRot = cv.CreateMat(3, 3, cv.CV_32FC1);
+  extRotMat = cv.CreateMat(3, 3, cv.CV_32FC1);
+  extRotMat[0,0] = 1; extRotMat[0,1] = 0; extRotMat[0,2] = 0;
+  extRotMat[1,0] = 0; extRotMat[1,1] = 1; extRotMat[1,2] = 0;
+  extRotMat[2,0] = 0; extRotMat[2,1] = 0; extRotMat[2,2] = 1;
+  extRotVec = cv.CreateMat(1, 3, cv.CV_32FC1);
+  cv.Rodrigues2(extRotMat, extRotVec);
+
+
+  extTrans = cv.CreateMat(1, 3, cv.CV_32FC1);
+  extTrans[0,0] = 0;
+  extTrans[0,1] = 0;
+  extTrans[0,2] = 0;
+
+  camera = string.lower(camera);
+  if camera == 'bbl' or camera == 'bumblebee2left':
+    distCoeffs = bbLeftDistCoeffs;
+    intrinsics = bbLeftIntrinsics;
+  elif camera == 'bbr' or camera == 'bumblebee2right':
+    distCoeffs = bbRightDistCoeffs;
+    intrinsics = bbRightIntrinsics;
+  #elif camera == 'pro' or camera == 'prosilica':
+  #  distCoeffs = prosilicaDistCoeffs;
+  #  intrinsics = prosilicaIntrinsics;
+
+  # create output point
+  img_pts = cv.CreateMat(N, 2, cv.CV_32FC1);
+
+  if N < 4:
+    # for some awful reason cv.ProjectPoints2 does not work correctly for <3 points...
+    tmp_points = cv.CreateMat(4, 3, cv.CV_32FC1);
+    for i in np.arange(N):
+      tmp_points[i,0] = points[i,0];
+      tmp_points[i,1] = points[i,1];
+      tmp_points[i,2] = points[i,2];
+      
+    tmp_img_pts = cv.CreateMat(4, 2, cv.CV_32FC1);
+
+    cv.ProjectPoints2(tmp_points, extRotVec, extTrans, intrinsics, distCoeffs, tmp_img_pts);
+
+    for i in np.arange(N):
+      img_pts[i,0] = tmp_img_pts[i,0];
+      img_pts[i,1] = tmp_img_pts[i,1];
+
+  else:
+    cv.ProjectPoints2(points, extRotVec, extTrans, intrinsics, distCoeffs, img_pts);
+
+  return img_pts
+
+def draw_point_cloud(image, pointCloud, camera='bbl', color=cv.Scalar(0, 0, 0)):
+  ''' 
+    draws a point cloud as red dots on the image
+  '''
+
+  # get transform between point cloud and camera
+  pts = ru.cloud2array(pointCloud);
+  pts_wrtCamera = ru.transform_with_frames(pointCloud.header.frame_id, cameraFrame[camera], pts);
+  projPts = cvmat2array(project_points(array2cvmat(pts_wrtCamera), camera));
+  projPts = np.cast[int](projPts);
+
+  for pt in projPts:
+    try:
+      cv.Circle(image, (pt[0], pt[1]), 2, color);
+    except:
+      # sometimes the draw fails for invalid pts but we don't really care
+      pass;
+
+
+def draw_pose(image, poseStamped, camera='bbl', name=''):
+  ''' 
+    draws a pose as an axis on the image 
+      the arrow will start at the pose position
+      and will extend 10cm in the x-axis of the pose
+    axes: x=red, y=green, b=blue
+  '''
+
+  # find axes points in pose frame
+  (trans, rot) = ru.pose2array(poseStamped.pose);
+  axisPts = np.zeros((4,3));
+  axisPts[0,0] = 0.1; # x-axis
+  axisPts[1,1] = 0.1; # y-axis
+  axisPts[2,2] = 0.1; # z-axis
+
+  axisPts_wrtPose = ru.transform_points(ru.get_tr(trans, rot), axisPts);
+  axisPts_wrtCamera = ru.transform_with_frames(poseStamped.header.frame_id, cameraFrame[camera], axisPts_wrtPose);
+
+  # draw lines on camera
+  projPts = cvmat2array(project_points(array2cvmat(axisPts_wrtCamera), camera));
+  projPts = np.cast[int](projPts);
+
+  try:
+    cv.Line(image, (projPts[3,0], projPts[3,1]), (projPts[0,0], projPts[0,1]), str2color('r'));
+    cv.Line(image, (projPts[3,0], projPts[3,1]), (projPts[1,0], projPts[1,1]), str2color('g'));
+    cv.Line(image, (projPts[3,0], projPts[3,1]), (projPts[2,0], projPts[2,1]), str2color('b'));
+
+    # display the name
+    if name != '':
+      cv.PutText(image, name, (projPts[3,0], projPts[3,1]), cv.InitFont(cv.CV_FONT_HERSHEY_SIMPLEX, 1.0, 1.0), str2color('r'));
+
+  except:
+    pass;
+ 
+
+def draw_bbox(image, pc=None, extents=None, useVariance=False, camera='bbl'):
+  '''
+    draw the 3D bounding box on the image
+    accepts either a point cloud (pc) or the extents
+    all points assumed to be in base link
+
+    extents = 3x2 array = [ xl, xu; yl, yu; zl, zu ]
+  '''
+
+  if pc:
+    # find extents from point cloud
+    pcArray = ru.cloud2array(pc);
+    if useVariance:
+      mean = np.mean(pcArray, axis=0);
+      var = np.var(pcArray, axis=0);
+      lowerExtents = mean - np.sqrt(var);  
+      upperExtents = mean + np.sqrt(var);  
+      # x-axis data is more reliable
+      lowerExtents[0] -= 0.5*np.sqrt(var[0]);
+      upperExtents[0] += 0.5*np.sqrt(var[0]);
+    else:
+      lowerExtents = np.min(pcArray, axis=0);
+      upperExtents = np.max(pcArray, axis=0);
+    extents = np.array([lowerExtents, upperExtents]).transpose();
+
+
+  bottom = np.array([ [extents[0,0], extents[1,0], extents[2,0]],
+                      [extents[0,0], extents[1,1], extents[2,0]],
+                      [extents[0,1], extents[1,1], extents[2,0]],
+                      [extents[0,1], extents[1,0], extents[2,0]]]);
+
+  top = np.array([  [extents[0,0], extents[1,0], extents[2,1]],
+                    [extents[0,0], extents[1,1], extents[2,1]],
+                    [extents[0,1], extents[1,1], extents[2,1]],
+                    [extents[0,1], extents[1,0], extents[2,1]]]);
+
+  bottom_wrtCamera = ru.transform_with_frames(ru.BASE_FRAME, cameraFrame[camera], bottom);
+  top_wrtCamera = ru.transform_with_frames(ru.BASE_FRAME, cameraFrame[camera], top);
+  bottom_wrtImage = cvmat2array(project_points(array2cvmat(bottom_wrtCamera), camera));
+  top_wrtImage = cvmat2array(project_points(array2cvmat(top_wrtCamera), camera));
+  bottom_wrtImage = np.cast[int](bottom_wrtImage);
+  top_wrtImage = np.cast[int](top_wrtImage);
+
+  red = str2color('r');
+  green = str2color('g');
+  blue = str2color('b');
+
+  b = bottom_wrtImage;
+  t = top_wrtImage;
+
+  try:
+    cv.Line(image, (b[0,0], b[0,1]), (b[1,0], b[1,1]), red);
+    cv.Line(image, (b[1,0], b[1,1]), (b[2,0], b[2,1]), red);
+    cv.Line(image, (b[2,0], b[2,1]), (b[3,0], b[3,1]), red);
+    cv.Line(image, (b[3,0], b[3,1]), (b[0,0], b[0,1]), red);
+   
+    cv.Line(image, (t[0,0], t[0,1]), (t[1,0], t[1,1]), green);
+    cv.Line(image, (t[1,0], t[1,1]), (t[2,0], t[2,1]), green);
+    cv.Line(image, (t[2,0], t[2,1]), (t[3,0], t[3,1]), green);
+    cv.Line(image, (t[3,0], t[3,1]), (t[0,0], t[0,1]), green);
+
+    cv.Line(image, (b[0,0], b[0,1]), (t[0,0], t[0,1]), blue);
+    cv.Line(image, (b[1,0], b[1,1]), (t[1,0], t[1,1]), blue);
+    cv.Line(image, (b[2,0], b[2,1]), (t[2,0], t[2,1]), blue);
+    cv.Line(image, (b[3,0], b[3,1]), (t[3,0], t[3,1]), blue);
+  except Exception as e:
+    #print 'Error when attempting to draw bbox: %s' % str(e)
+    pass;
+

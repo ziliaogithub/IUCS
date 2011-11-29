@@ -1,0 +1,447 @@
+import os
+import io
+import sys 
+import time 
+import copy 
+import math 
+import string 
+import numpy as np
+import scipy as sp
+
+import roslib; roslib.load_manifest('scripting_util');
+import rospy
+
+import std_msgs.msg as std_msgs
+import sensor_msgs.msg as sensor_msgs
+import geometry_msgs.msg as geometry_msgs
+
+import planning_msgs.msg as planning_msgs
+import planning_msgs.srv as planning_srvs
+
+import RosUtil as ru
+import Transform as tr
+import PointCloudUtil as pcu
+
+import ObjectModel as om
+
+OBSTACLE_NAMES = {};
+OBSTACLE_NAMES['all'] = 'ALL'; 
+OBSTACLE_NAMES['table'] = 'table'; 
+OBSTACLE_NAMES['grasped'] = 'GraspedObject'; 
+
+## setup services
+rospy.logdebug(__name__ + ': setting up service connections...')
+# collision world
+AddObstacle = ru.service_proxy('/WorldObstacleNode/AddObstacle', planning_srvs.RRTObs, not ru.is_sim());
+RemoveObstacle = ru.service_proxy('/WorldObstacleNode/RemoveObstacle', planning_srvs.RRTRemObs, not ru.is_sim());
+RemoveObstacleByName = ru.service_proxy('/WorldObstacleNode/RemoveObstacleByName', planning_srvs.RRTRemObsByName, not ru.is_sim());
+
+
+def add_obstacle(req):
+  ''' 
+    adds the obstacle to the collision world model 
+
+    req - RRTObsRequest message
+  '''
+  try:
+    resp = AddObstacle(req);
+  except:
+    rospy.logerr(__name__ + ': AddObs service request failed');
+    return False;
+  
+  return resp.success;
+
+
+def add_sphere(center, radius, name='sphere', frame_id=ru.BASE_FRAME):
+  ''' 
+    add a sphere to the collision map 
+
+    frame_id - frame of the data
+
+    NOTE: any headers in the input are not used, frame_id must be set
+    NOTE: the collision world uses the most recent transform so time stamps are not used
+  '''
+  sphere = planning_msgs.CollisionSphere();
+  sphere.name = name;
+  sphere.header.frame_id = frame_id;
+  sphere.radius = radius;
+  sphere.point = ru.to_Point(center);
+
+  return add_obstacle(planning_srvs.RRTObsRequest(type=1, sphere=sphere));
+
+
+def add_plane(normal, point, name='plane', frame_id=ru.BASE_FRAME):
+  ''' 
+    add a plane to the collision map
+
+    frame_id - frame of the data
+
+    NOTE: any headers in the input are not used, frame_id must be set
+    NOTE: the collision world uses the most recent transform so time stamps are not used
+  '''
+  plane = planning_msgs.CollisionPlane();
+  plane.name = name;
+  plane.header.frame_id = frame_id;
+  plane.normal = ru.to_Point(normal);
+  plane.point = ru.to_Point(point);
+
+  return add_obstacle(planning_srvs.RRTObsRequest(type=2, plane=plane));
+
+
+def add_bounded_plane(point1, point2, point3, point4, thickness, name='bounded_plane', frame_id=ru.BASE_FRAME):
+  ''' 
+    add a bounded plane to the collision map 
+
+    corners of the bounded plane must be entered clockwise
+
+    frame_id - frame of the data
+
+    NOTE: any headers in the input are not used, frame_id must be set
+    NOTE: the collision world uses the most recent transform so time stamps are not used
+  '''
+  bplane = planning_msgs.CollisionBoundedPlane();
+  bplane.name = name;
+  bplane.header.frame_id = frame_id;
+  bplane.thickness = thickness/2.0;
+
+  bplane.points.append(ru.to_Point(point1));
+  bplane.points.append(ru.to_Point(point2));
+  bplane.points.append(ru.to_Point(point3));
+  bplane.points.append(ru.to_Point(point4));
+
+  return add_obstacle(planning_srvs.RRTObsRequest(type=3, boundedplane=bplane));
+
+
+def add_cylinder(topCenter, bottomCenter, radius, name='cylinder', frame_id=ru.BASE_FRAME):
+  ''' 
+    add a capsule shape to the collision map
+    
+    frame_id - frame of the data
+
+    NOTE: any headers in the input are not used, frame_id must be set
+    NOTE: the collision world uses the most recent transform so time stamps are not used
+  '''
+  cylinder = planning_msgs.CollisionCylinder();
+  cylinder.name = name;
+  cylinder.header.frame_id = frame_id
+  cylinder.radius = radius;
+  cylinder.points = [ru.to_Point(topCenter), ru.to_Point(bottomCenter)]
+  return add_obstacle(planning_srvs.RRTObsRequest(type=0, cylinder=cylinder));
+
+
+def add_point_cloud(pc, radius=0.002, name='point_cloud', frame_id=ru.BASE_FRAME):
+  ''' 
+    adds a collision model from a point cloud 
+
+    frame_id - frame of the data
+
+    NOTE: any headers in the input are not used, frame_id must be set
+    NOTE: the collision world uses the most recent transform so time stamps are not used
+  '''
+  cloud = planning_msgs.CollisionCloud();
+  cloud.name = name;
+  cloud.cloud = ru.to_PointCloud(pc, frame_id=frame_id);
+  cloud.radius = radius;
+
+  return add_obstacle(planning_srvs.RRTObsRequest(type=5, cloud=cloud));
+
+
+def add_grasped_sphere(center, radius, frame_id=ru.BASE_FRAME):
+  ''' 
+    add a grasped sphere to the collision map 
+    
+    frame_id - frame of the data
+
+    NOTE: any headers in the input are not used, frame_id must be set
+    NOTE: the collision world uses the most recent transform so time stamps are not used
+  '''
+  sphere = planning_msgs.CollisionGrasp();
+  sphere.name = OBSTACLE_NAMES['grasped'];
+  sphere.header.frame_id = frame_id;
+  sphere.radius = radius;
+  sphere.point = ru.to_Point(center);
+
+  return add_obstacle(planning_srvs.RRTObsRequest(type=4, handobject=sphere));
+
+
+def add_grasped_point_cloud(pc, radius=0.002, frame_id=ru.BASE_FRAME):
+  ''' 
+    add a grasped point cloud to the collision map 
+    
+    frame_id - frame of the data
+
+    NOTE: any headers in the input are not used, frame_id must be set
+    NOTE: the collision world uses the most recent transform so time stamps are not used
+  '''
+  cloud = planning_msgs.CollisionCloud();
+  cloud.name = OBSTACLE_NAMES['grasped'];
+  cloud.cloud = ru.to_PointCloud(pc, frame_id=frame_id);
+  cloud.radius = radius;
+
+  return add_obstacle(planning_srvs.RRTObsRequest(type=6, handcloud=cloud));
+
+
+def remove_by_name(name):
+  ''' removes the given object from the collision model '''
+  global OBSTACLE_NAMES
+
+  success = True;
+  if (name in OBSTACLE_NAMES):
+    tname = OBSTACLE_NAMES[name];
+    if (type(tname) == str):
+      names = [tname];
+    else:
+      names = tname;
+  else:
+    names = [name];
+
+  try:
+    for n in names:
+      resp = RemoveObstacleByName(n);
+      success &= resp.success;
+  except:
+    rospy.logerr(__name__ + ': RemoveObsByName service request failed');
+    return False;
+  
+  return success;
+
+
+def remove_grasped_obstacle():
+  ''' removed the grasped object from the collision model '''
+  # the grasped object is one collection of objects name 'GraspedObject'
+  return remove_by_name(OBSTACLE_NAMES['grasped']);
+
+
+def add_table(height):
+  ''' adds the table plane to the collision world '''
+  rospy.loginfo(__name__ + ': adding table to collision model with height %0.3f' % height);
+  return add_plane([0, 0, -1], [1, 0.0, height], name=OBSTACLE_NAMES['table'], frame_id=ru.BASE_FRAME);
+
+
+def remove_table():
+  ''' removes the table plane from the collision world '''
+  rospy.loginfo('Removing table from the world collision model');
+  return remove_by_name(name=OBSTACLE_NAMES['table']);
+
+
+def add_model(name, objPose, radius=0.002, resolution='mdres', leafSize=[0.04, 0.04, 0.04]):
+  ''' 
+    adds in the collision model for the given object 
+    the collision model is derived from the point cloud object model
+  '''
+  global OBSTACLE_NAMES
+  rospy.loginfo(__name__ + ': adding %s model to the collision world' % (name));
+  # if (name == 'door'):
+  #   # door is too big to use a point cloud model (use bounded plane)
+  #   model = om.get_pc_model(name, resolution=resolution);
+  #   bbox = pcu.get_bbox(model);
+  #   # get actual door bbox (remove base)
+  #   model = model[model[:,0] > -bbox[0,1]+0.005, :];
+  #   bbox = pcu.get_bbox(model);
+  #   dim = bbox[:,1] - bbox[:,0];
+
+  #   objPose = ru.transformPose(ru.BASE_FRAME, ru.to_PoseStamped(objPose));
+  #   T = tr.rospose2tr(objPose);
+    
+  #   # corners (accounting for capsules)
+  #   urc = np.array([ dim[0]/2.0 - dim[2]/2.0,  dim[1]/2.0 - dim[2]/2.0,  0.0, 1.0]);
+  #   lrc = np.array([ dim[0]/2.0 - dim[2]/2.0, -dim[1]/2.0 + dim[2]/2.0,  0.0, 1.0]);
+  #   llc = np.array([-dim[0]/2.0 + dim[2]/2.0, -dim[1]/2.0 + dim[2]/2.0,  0.0, 1.0]);
+  #   ulc = np.array([-dim[0]/2.0 + dim[2]/2.0,  dim[1]/2.0 - dim[2]/2.0,  0.0, 1.0]);
+  #   corners = np.vstack((urc, lrc, llc, ulc));
+  #   corners_wrtBase = np.dot(T, corners.T);
+  #   thickness = dim[2];
+
+  #   return add_bounded_plane(corners_wrtBase[:3,0], corners_wrtBase[:3,1], corners_wrtBase[:3,2], corners_wrtBase[:3,3], thickness, name=name, frame_id=ru.BASE_FRAME);
+    
+  # else:
+
+  # is a collision model available
+  (spheres, cylinders) = om.get_collision(name, objPose);
+  if (len(spheres) > 0 or len(cylinders) > 0):
+    rospy.loginfo(__name__ + ': adding hand labeled %s model to the collision world' % (name));
+
+    # create request messages
+    success = True;
+    
+    names = []
+    
+    req = planning_srvs.RRTObsRequest();
+    req.type = req.CSPHERE;
+    for sphere in spheres:
+      req.sphere = sphere;
+      names.append(sphere.name)
+      success &= add_obstacle(req);
+
+    req.type = req.CCYLINDER;
+    for cylinder in cylinders:
+      req.cylinder = cylinder;
+      names.append(cylinder.name)
+      success &= add_obstacle(req);
+    
+    # add collision names to dict
+    OBSTACLE_NAMES[name] = names;
+
+    return success
+
+  else:
+    rospy.loginfo(__name__ + ': adding %s mesh model to the collision world' % (name));
+
+    # get the point cloud model
+    model = om.get_pc_model(name, pose=objPose, resolution=resolution);
+
+    downsampledModel = pcu.downsample(model, leafSize=leafSize);
+    
+    return add_point_cloud(downsampledModel, radius=radius, name=name);
+
+
+def add_grasped_model(name, objPose, radius=0.002, leafSize=[0.025, 0.025, 0.025]):
+  ''' 
+    adds in the collision model for the given object 
+    the collision model is derived from the point cloud object model
+    
+    the larger the leafSize, the sparser the point cloud
+  '''
+  global OBSTACLE_NAMES
+
+  # is a collision model available
+  (spheres, cylinders) = om.get_collision(name, objPose); 
+  if (len(spheres) > 0 or len(cylinders) > 0):
+    rospy.loginfo(__name__ + ': adding hand labeled %s mesh model to the collision' % (name));
+
+    # create request messages
+    success = True;
+    req = planning_srvs.RRTObsRequest();
+    req.type = req.CSPHERE_IN_HAND;
+    for sphere in spheres:
+      req.handobject = sphere;
+      req.handobject.name = OBSTACLE_NAMES['grasped'];
+      success &= add_obstacle(req);
+
+    for cylinder in cylinders:
+      # add 2 spheres for every cylinder because only spheres are allowed to be grasped
+      sphere1 = planning_msgs.CollisionSphere()
+      sphere1.name = cylinder.name + "1"
+      sphere1.header = cylinder.header
+      sphere1.point = cylinder.points[0]
+      sphere1.radius = cylinder.radius
+      
+      req.handobject = sphere1;
+      req.handobject.name = OBSTACLE_NAMES['grasped'];
+      success &= add_obstacle(req);
+
+      sphere2 = planning_msgs.CollisionSphere()
+      sphere2.name = cylinder.name + "2"
+      sphere2.header = cylinder.header
+      sphere2.point = cylinder.points[1]
+      sphere2.radius = cylinder.radius
+
+      req.handobject = sphere2;
+      req.handobject.name = OBSTACLE_NAMES['grasped'];
+      success &= add_obstacle(req);
+      
+    return success
+
+  else:
+    rospy.loginfo(__name__ + ': adding %s mesh model to the grasp collision' % (name));
+
+    # get the point cloud model
+    model = om.get_pc_model(name, pose=objPose);
+
+    # downsample the model
+    downsampledModel = pcu.downsample(model, leafSize=leafSize);
+
+    return add_grasped_point_cloud(downsampledModel, radius=radius);
+
+
+def add_from_obj_msg(obj):
+  '''
+    adds the object to the world model
+    uses blob pts or the model accordingly
+  '''
+  if (obj.use_sensor_data_for_collisions):
+    # transform pts to orig pose frame
+    Tpose0 = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, obj.orig_refined_pose));
+    Tpose1 = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, obj.pose));
+
+    # get pts wrt original pose
+    pts_wrtBase = ru.to_array(obj.blob.points);
+    pts_wrtBase = np.vstack((pts_wrtBase.T, np.ones(pts_wrtBase.shape[0]))); 
+    pts_wrtPose0 = np.dot(np.linalg.inv(Tpose0), pts_wrtBase);
+    pts_wrtBase_forPose1 = np.dot(Tpose1, pts_wrtPose0);
+
+    pc = ru.to_PointCloud(pcu.downsample(pts_wrtBase_forPose1.T[:,:3], [0.03, 0.03, 0.03]));
+
+    success = add_point_cloud(pc, name=obj.name, radius=0.01);
+  else:
+    success = add_model(obj.name, obj.pose);
+
+  return success;
+
+def populate_world_model(graspedObjects, objects, tableHeight):
+  ''' 
+    populates the world model with the object models and table
+      graspedObjects is a list of (pose, obj) tuples of grasped objects
+      objects is a list of obj messages
+  '''
+  # first clear the world
+  clear();
+
+  success = True;
+
+  # add table
+  success &= add_table(tableHeight);
+
+  # add in grasped objects 
+  if graspedObjects:
+    for (graspPose, obj) in graspedObjects:
+      if (obj.use_sensor_data_for_collisions):
+        # transform pts to orig pose frame
+        Tpose0 = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, obj.orig_refined_pose));
+        Tgrasp = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, ru.to_PoseStamped(graspPose)));
+
+        # get pts wrt original pose
+        pts_wrtBase = ru.to_array(obj.blob.points);
+        pts_wrtBase = np.vstack((pts_wrtBase.T, np.ones(pts_wrtBase.shape[0]))); 
+        pts_wrtPose0 = np.dot(np.linalg.inv(Tpose0), pts_wrtBase);
+        grasppts_wrtBase = np.dot(Tgrasp, pts_wrtPose0);
+
+        pc = ru.to_PointCloud(pcu.downsample(grasppts_wrtBase.T[:,:3], [0.03, 0.03, 0.03]));
+
+        success &= add_grasped_point_cloud(pc, radius=0.01);
+      else:
+        success &= add_grasped_model(obj.name, ru.transformPose(ru.BASE_FRAME, graspPose));
+
+  # add in other objects
+  if objects:
+    for obj in objects:
+      if (obj.use_sensor_data_for_collisions):
+        # transform pts to orig pose frame
+        Tpose0 = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, obj.orig_refined_pose));
+        Tpose1 = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, obj.pose));
+
+        # get pts wrt original pose
+        pts_wrtBase = ru.to_array(obj.blob.points);
+        pts_wrtBase = np.vstack((pts_wrtBase.T, np.ones(pts_wrtBase.shape[0]))); 
+        pts_wrtPose0 = np.dot(np.linalg.inv(Tpose0), pts_wrtBase);
+        pts_wrtBase_forPose1 = np.dot(Tpose1, pts_wrtPose0);
+
+        pc = ru.to_PointCloud(pcu.downsample(pts_wrtBase_forPose1.T[:,:3], [0.03, 0.03, 0.03]));
+
+        success &= add_point_cloud(pc, name=obj.name, radius=0.01);
+      else:
+        success &= add_model(obj.name, obj.pose);
+    
+  return success; 
+
+
+def clear():
+  ''' clear the collision world model '''
+  global OBSTACLE_NAMES
+
+  return remove_by_name(OBSTACLE_NAMES['all']);
+
+
+def cleanup():
+  clear();
+

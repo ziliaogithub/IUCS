@@ -1,0 +1,1559 @@
+import sys
+import time
+import math
+import copy 
+import numpy as np
+import scipy as sp 
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+import tf
+import PyKDL as kdl
+
+import std_msgs.msg as std_msgs
+import geometry_msgs.msg as geometry_msgs
+import visualization_msgs.msg as visualization_msgs
+
+import WAM_msgs.msg as WAM_msgs
+import pr_msgs.msg as pr_msgs
+import pr_msgs.srv as pr_srvs
+
+import planning_msgs.msg as planning_msgs
+import planning_msgs.srv as planning_srvs
+import guarded_move_msgs.srv as guarded_move_srvs
+import torque_control_msgs.srv as torque_control_srvs
+import wam_calibrate_msgs.srv as wam_calibrate_srvs
+
+import RosUtil as ru
+import Transform as tr
+import WorldModel as wm
+import Kinematics as kine
+import led
+
+import Hand
+
+WAMMODE_POSITION_TRPZ             = 102;
+WAMMODE_IDLE                      = 200;
+
+DEFAULT_JOINT_STIFFNESS = 1.0
+DEFAULT_TRPZ_MIN_ACCEL_TIME = 1.0;
+DEFAULT_TRPZ_VEL = [0.5,  # Shoulder Pan
+                    0.5,  # Shoulder Pitch
+                    0.5,  # Upper Arm Twist
+                    0.5,  # Elbow Pitch
+                    0.5,  # Wrist Roll
+                    0.5,  # Wrist Pitch
+                    0.5]; # Hand Roll
+
+ARM_DOF = rospy.get_param('/arm_dof',7);
+ARM_LEN = 1.4; # meters (very rough estimate)
+FIXED_FRAME = ru.ARM_FIXED_FRAME;
+TIP_FRAME = ru.TIP_FRAME;
+WRIST_FRAME = ru.WRIST_FRAME;
+PALM_FRAME = ru.PALM_FRAME;
+PALM2WRIST = 0.093;
+
+WING_POSITIONS = np.array([0.0, -1.5, 0.0, 2.5, 0.0, 0.0, 0.0] if ru.is_upenn() else [-1.5, -1.5, 0.0, 2.5, 0.0, 0.0, 0.0]);
+
+# ik failure strings
+IK_STATUS = {-1: 'ros service call failed',
+              0: 'success',
+              1: 'pose outside of reachable workspace', 
+              2: 'no valid solutions', 
+              3: 'pose in collision'};
+
+# rrt failure strings
+RRT_STATUS = {-1: 'ros service call failed',
+               0: 'success',
+               2: 'unable to set RRT* parameters',
+               3: 'start configuration in collision',
+               4: 'goal configuration in collision',
+               5: 'exceeded maximum time limit'};
+
+
+
+# current arm torques
+torques = np.zeros(ARM_DOF);
+
+# current arm joint angles
+# NOTE: if you want to save these angles to a local variable, you should
+# deepcopy it.  or just use Arm.get_positions()
+positions = np.zeros(ARM_DOF);
+
+state = pr_msgs.WAMState.state_free;
+
+prev_traj_state = pr_msgs.TrajInfo.state_done;
+
+def get_positions():
+  global positions
+  return copy.deepcopy(positions)
+
+def WAMStateCallback(data):
+  global torques, positions, state, prev_traj_state
+  positions[:] = data.positions;
+  torques[:] = data.torques;
+  state = data.state;
+  prev_traj_state = data.prev_trajectory.state;
+
+## setup ros subscribers
+if rospy.get_param('/debug', False):
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': setting up subscribers...');
+# owd
+rospy.Subscriber('/owd/wamstate', pr_msgs.WAMState, WAMStateCallback, None, 1)
+
+## setup publishers
+if rospy.get_param('/debug', False):
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': setting up publishers...');
+testPosePub = rospy.Publisher('/test_pose', geometry_msgs.PoseStamped);
+planningPosePub = rospy.Publisher('/RightArm/WAM/markers/planning_pose', geometry_msgs.PoseStamped);
+pathMarkerPub = rospy.Publisher('/RightArm/WAM/markers/followed_path', visualization_msgs.Marker);
+graspPosesPub = rospy.Publisher('/RightArm/WAM/markers/grasp_poses', geometry_msgs.PoseArray);
+wamServoPub = rospy.Publisher('/owd/wamservo', pr_msgs.Servo);
+rospy.sleep(1.0);
+
+## setup services
+if rospy.get_param('/debug', False):
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': setting up service connections...')
+
+# owd
+CancelTrajectory = ru.service_proxy('/owd/CancelAllTrajectories', pr_srvs.CancelAllTrajectories, not ru.is_sim());
+SetStiffness = ru.service_proxy('/owd/SetStiffness', pr_srvs.SetStiffness, not ru.is_sim());
+SetSpeed = ru.service_proxy('/owd/SetSpeed', pr_srvs.SetSpeed, not ru.is_sim());
+AddTrajectory = ru.service_proxy('/owd/AddTrajectory', pr_srvs.AddTrajectory, not ru.is_sim());
+AddMass = ru.service_proxy('/owd/SetExtraMass', pr_srvs.SetExtraMass, not ru.is_sim());
+GuardedMove = ru.service_proxy('/owd/GuardedMove', guarded_move_srvs.GuardedMoveTrajectory, not ru.is_sim());
+TorqueControl = ru.service_proxy('/owd/AddTorqueTrajectory', torque_control_srvs.TorqueControl, not ru.is_sim());
+
+# upenn
+GetFK = ru.service_proxy('GetFK', planning_srvs.GetFK, not ru.is_sim());
+GetIK = ru.service_proxy('GetIK', planning_srvs.GetIK, not ru.is_sim());
+RRTStarPlan = ru.service_proxy('RRTStarPlan', planning_srvs.RRTPlan, not ru.is_sim());
+GetLowestFingerPoint = ru.service_proxy('/GetLowestFingerPoint', planning_srvs.GetLowestFingerColPoint, not ru.is_sim());
+GetLowestElbowPoint = ru.service_proxy('/GetLowestElbowPoint', planning_srvs.GetLowestFingerColPoint, not ru.is_sim());
+GetLowestWristPoint = ru.service_proxy('/GetLowestWristPoint', planning_srvs.GetLowestFingerColPoint, not ru.is_sim());
+#
+IKPreplanner = ru.service_proxy('ik_preplanner', planning_srvs.IKPreplanner, not ru.is_sim());
+WamCalibrate = ru.service_proxy('/calibration_server/get_adjustment', wam_calibrate_srvs.GetAdjustment, not ru.is_sim());
+
+def test_pose(pose):
+  testPosePub.publish(pose); 
+
+def set_mode(mode):
+  if rospy.get_param('/debug', False):
+    rospy.loginfo(rospy.get_name() + ':' + __name__ + ': setting wam mode: %d' % mode);
+
+  if (mode == WAMMODE_IDLE):
+    return set_stiffness(0);
+  elif (mode == WAMMODE_POSITION_TRPZ):
+    return set_stiffness(DEFAULT_JOINT_STIFFNESS);
+  else:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + '.set_mode: unkown wam mode %d' % mode);
+    return False;
+
+def set_stiffness(stiffness):
+  # TODO: convert this to use SetJointStiffness
+  global SetStiffness;
+  if rospy.get_param('/debug', False):
+    rospy.loginfo(rospy.get_name() + ':' + __name__ + ': setting stiffness to: %s' % stiffness);
+
+  try:
+    resp = SetStiffness(stiffness);
+  except rospy.ServiceException, e:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': SetStiffness service request failed');
+    return False;
+
+  if not resp.ok:
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + '.set_stiffness: SetStiffness not ok: %s' % (resp.reason));
+
+  return resp.ok;
+  
+def reset_stiffness():
+  return set_stiffness(DEFAULT_JOINT_STIFFNESS);
+
+def set_trapezoidal_properties(vel, minAccelTime=1.0):
+  rospy.logwarn(rospy.get_name() + ':' + __name__ + ': set_trapezoidal_properties() is deprecated, use set_speed() instead');
+  return set_speed(vel, minAccelTime);
+
+def set_speed(vel, minAccelTime=1.0):
+  global SetSpeed;
+  if rospy.get_param('/debug', False):
+    rospy.loginfo(rospy.get_name() + ':' + __name__ + ': SetSpeed: vel=%s min_accel_time=%0.2f' % (str(vel), minAccelTime));
+
+  # format arguments if needed
+  if (hasattr(vel, '__iter__')):
+    if (len(vel) != ARM_DOF):
+      rospy.logerr(rospy.get_name() + ':' + __name__ + '.set_speed: vel argument does not have correct length (%d != %d)' % (len(vel), ARM_DOF));
+      return False;
+  else:
+    vel = [vel]*ARM_DOF;
+
+  try:
+    resp = SetSpeed(velocities=vel, min_accel_time=minAccelTime);
+  except rospy.ServiceException as err:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + '.set_speed: SetSpeed service request failed: %s' % err);
+    return False;
+
+  if not resp.ok:
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + '.set_speed: SetSpeed not ok: %s' % (resp.reason));
+
+  return resp.ok;
+
+def reset_speed():
+  set_speed(DEFAULT_TRPZ_VEL, DEFAULT_TRPZ_MIN_ACCEL_TIME)
+
+def reset_trapezoidal_properties():
+  rospy.logwarn(rospy.get_name() + ':' + __name__ + ': reset_trapezoidal_properties() is deprecated, use reset_speed() instead');
+  return reset_speed() #set_trapezoidal_properties(DEFAULT_TRPZ_VEL, DEFAULT_TRPZ_MIN_ACCEL_TIME);
+  
+def add_mass(mass, cog=[0, 0, 0], inertia=[0, 0, 0, 0, 0, 0]):
+  m = pr_msgs.MassProperties();
+  m.link = 7;
+  m.mass = mass;
+  m.cog_x, m.cog_y, m.cog_z = cog;
+  m.inertia_xx, m.inertia_xy, m.inertia_xz, m.inertia_yy, m.inertia_yz, m.inertia_zz = inertia;
+
+  try:
+    resp = AddMass(m);
+  except rospy.ServiceException as err:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': SetExtraMass service request failed: %s' % err);
+    return False;
+
+  if not resp.ok:
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + '.add_mass: SetExtraMass not ok: %s' % (resp.reason));
+
+  return resp.ok;
+
+def clear_mass():
+  add_mass(0);
+
+def cancel_trajectory():
+  try:
+    CancelTrajectory();
+  except rospy.ServiceException as err:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': CancelAllTrajectories service request failed: %s' % err);
+
+def stop():
+  return cancel_trajectory();
+
+
+
+def guarded_move(vel, force_thres, max_dist=0.10, sensitivity=0, wait=True, preempt_requested_fcn=None, short_circuit_fcn=None): 
+  ''' wrapper for the guarded move service '''
+  global GuardedMove, state, prev_traj_state;
+  
+  vel = ru.to_Vector3(vel); 
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': guarded move with vel: %s, force thres: %0.3f, max distance: %0.3f' % (ru.to_array(vel), force_thres, max_dist));
+  
+  cancel_trajectory();
+
+  try:
+    ## send move command
+    resp = GuardedMove(velocity=vel, max_distance=max_dist, force_threshold=force_thres, sensitivity=sensitivity);
+    rospy.loginfo(rospy.get_name() + ':' + __name__ + ': guarded move trajectory %d' % resp.id);
+  except rospy.ServiceException as err:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': AddTrajectory service request failed: %s' % err);
+    return 1;
+  
+  if (not resp.ok):
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': guarded_move not ok: %s' % resp.reason);
+    return 1;
+
+  # wait for it to move through the trajectory
+  if wait:
+    
+    t0 = rospy.Time().now().to_sec();
+    while (state != pr_msgs.WAMState.state_traj_active and
+           state != pr_msgs.WAMState.state_traj_stalled):
+      rospy.sleep(0.01)
+      if (rospy.Time().now().to_sec() - t0) > 1.0:
+        rospy.logwarn(__name__ + ': guarded move took too long to start trajectory')
+        break;
+
+    #t1 = rospy.Time().now().to_sec();
+    #print 'waited for arm state to change from %f to %f ' % (t0, t1)
+    while (state == pr_msgs.WAMState.state_traj_active or 
+           state == pr_msgs.WAMState.state_traj_stalled):
+      
+      #dt = rospy.Time().now().to_sec() - t0; 
+
+      if (preempt_requested_fcn and preempt_requested_fcn()):
+        return -1;
+
+      if (short_circuit_fcn and short_circuit_fcn()):
+        return -2;
+      
+      if rospy.is_shutdown():
+        return -3
+      
+      # TODO: timeout?
+      #if (dt > moveTimeout):
+      #  rospy.logwarn(rospy.get_name() + ':' + __name__ + ': timeout on move after %0.3f sec' % (dt));
+      #  break;
+    
+    # guarded move is done. 
+    
+    # look at trajectory state to determine if trajectory was aborted
+    # return a different error code if aborted
+    if (prev_traj_state == pr_msgs.TrajInfo.state_aborted):
+      rospy.loginfo(rospy.get_name() + ':' + __name__ + ': guarded_move aborted');
+      return 2;
+  return 0;
+
+
+def guarded_move_until_clear(vel, force_thres, max_dist=0.10, sensitivity=0, preempt_requested_fcn=None, short_circuit_fcn=None): 
+  ''' 
+  does a guarded move with the specified parameters until rrt_star is out of "start configuration in collision".
+
+  note that return codes may be messed up w.r.t guarded_move return codes vs. rrt_star return codes.
+  '''
+  global GuardedMove, state, prev_traj_state;
+  
+  vel = ru.to_Vector3(vel); 
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': attempting guarded move to get out of collision');
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': guarded move with vel: %s, force thres: %0.3f, max distance: %0.3f' % (ru.to_array(vel), force_thres, max_dist));
+  
+  (rrtStatus, rrt) = rrt_star(finalJointAngles=positions, 
+                              initialJointAngles=positions, 
+                              fingerPositions=Hand.positions, 
+                              fingerSecondaryPositions=Hand.secondaryPositions, 
+                              maxTime=0.1);
+  
+  if rrtStatus != 3:
+    return rrtStatus
+  
+  cancel_trajectory();
+
+  try:
+    ## send move command
+    resp = GuardedMove(velocity=vel, max_distance=max_dist, force_threshold=force_thres, sensitivity=sensitivity);
+  except rospy.ServiceException as err:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': AddTrajectory service request failed: %s' % err);
+    return 1;
+
+  if (not resp.ok):
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': guarded_move_until_clear not ok: %s' % resp.reason);
+    return 1;
+
+  # TODO: wait until the arm has started (state=moving)
+  rospy.sleep(0.2);
+
+  # wait for it to move through the trajectory or rrt_star to succeed
+  t0 = rospy.Time().now().to_sec();
+  while (state == pr_msgs.WAMState.state_traj_active or 
+         state == pr_msgs.WAMState.state_traj_stalled):
+    dt = rospy.Time().now().to_sec() - t0; 
+
+    if (preempt_requested_fcn and preempt_requested_fcn()):
+      return -1;
+
+    if (short_circuit_fcn and short_circuit_fcn()):
+      return -2;
+
+    if rospy.is_shutdown():
+      return -3
+    
+    (rrtStatus, rrt) = rrt_star(finalJointAngles=positions, 
+                                initialJointAngles=positions, 
+                                fingerPositions=Hand.positions, 
+                                fingerSecondaryPositions=Hand.secondaryPositions, 
+                                maxTime=0.1);
+    
+    rospy.sleep(0.2)
+    
+    if rrtStatus != 3:
+      cancel_trajectory();
+      return rrtStatus
+
+    # look at trajectory state to determine if trajectory was aborted
+    # return a different error code if aborted
+    #if (prev_traj_state == pr_msgs.TrajInfo.state_aborted):
+    #  return 2;
+
+  return 5;
+
+
+def move_arm(jointAngles, blendRadius=0.09):
+  ''' command the arm to move to the given joint angles '''
+  global AddTrajectory
+
+  # convert to wam set joint positions msgs
+  if (type(jointAngles) == WAM_msgs.SetJointPositions or type(jointAngles) == WAM_msgs.ArmPositions):
+    jointAngles = map(lambda x: list(x.wamPositions), jointAngles)
+
+  cancel_trajectory();
+
+  # format message
+  traj = pr_msgs.JointTraj();
+  traj.positions = [pr_msgs.Joints(positions), pr_msgs.Joints(jointAngles)];
+  traj.blend_radius = [blendRadius, blendRadius];
+
+  try:
+    AddTrajectory(traj);
+  except rospy.ServiceException as err:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': AddTrajectory service request failed: %s' % err);
+
+def follow_path(path, moveTimeout=0.0, preempt_requested_fcn=None, short_circuit_fcn=None, blendRadius=0.09, cancelOnStall=False, wait=True):
+  '''
+  path can be:
+   * list of WAM_msgs.SetJointPositions
+   * list of WAM_msgs.ArmPositions
+   * list of pr_msgs.Joints
+   * list of list of joint angles
+
+  if the first waypoint is not the current arm position, it will be prepended 
+  to the list.
+  
+  moveTimeout is how many seconds before we stop waiting for the arm to complete motion.
+  if not specified, a default timeout will be calculated.
+  for no timeout, give the value None
+  if timeout, -3 is returned.  note, arm motion is not stopped.
+
+  when preempt_requested_fcn evaluates to True, -1 is returned.  
+  note, arm motion is not stopped.
+  
+  when short_circuit_fcn evaluates to True, -2 is returned.
+  note, arm motion is not stopped.
+  
+  blendRadius is the smoothing radius for the waypoints, in radians.
+  note: RRT* uses 0.2 as the default distance between waypoints.  
+  The blendRadius must be less than half of this in order to smooth the path.
+  
+  other error codes:
+   1 is returned if the service call fails.
+   2 is returned if the arm takes longer than 1 second to start moving.
+   0 is returned on success when the arm has finished its trajectory.
+  '''
+  global AddTrajectory;
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': moving arm through path of length %d' % len(path));
+  
+  if moveTimeout == 0.0:
+    # actual default value is 15 seconds or 1 second per waypoint, whichever is greater
+    moveTimeout = max(15, len(path))
+
+  if (len(path) == 0):
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': trying to move through 0 length path');
+    return 0
+
+  # convert to flat list
+  if (type(path[0]) == WAM_msgs.SetJointPositions or type(path[0]) == WAM_msgs.ArmPositions):
+    path = map(lambda x: list(x.wamPositions), path)
+  elif (type(path[0]) == pr_msgs.Joints):
+    path = map(lambda x: list(x.j), path)
+
+  cancel_trajectory();
+
+  try:
+    # publish path marker for rviz display
+    publish_path_marker(path);
+  except Exception as e:
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': ' + str(e));
+    
+  traj = pr_msgs.JointTraj();
+  traj.positions = [];
+  traj.blend_radius = [];
+  if cancelOnStall:
+    traj.options = traj.opt_CancelOnStall
+
+  # only add current position if not already first element in path
+  if closeTo(path[0], positions) == False:
+    traj.positions = [pr_msgs.Joints(positions)];
+    traj.blend_radius = [blendRadius];
+    
+  for jp in path:
+    traj.positions.append(pr_msgs.Joints(jp));
+    traj.blend_radius.append(blendRadius);
+  
+  if len(traj.positions) == 1:
+    rospy.loginfo(rospy.get_name() + ':' + __name__ + ': already at configuration');
+    return 0
+  
+  # TODO:
+  # put publish_path_marker(path) here
+  # need to make publish_path_marker() to be able to take different path types. pr_msgs.Joints, etc.
+
+  try:
+    ## command the arm to move through the trajectory
+    resp = AddTrajectory(traj);
+  except rospy.ServiceException as err:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': AddTrajectory service request failed: %s' % err);
+    return 1;
+  
+  if (resp.ok == False):
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': AddTrajectory service request not ok: %s' % resp.reason);
+    return 1;
+  
+  if not wait:
+    clear_path_marker();
+    return 0
+  
+  # wait for trajectory to start moving
+  t0 = rospy.Time().now().to_sec();
+  while (state != pr_msgs.WAMState.state_traj_active and \
+           state != pr_msgs.WAMState.state_traj_stalled):
+    
+    # wait at most 1 second for trajectory to start moving
+    dt = rospy.Time().now().to_sec() - t0;
+    if (dt > 1.0):
+      rospy.logerr(rospy.get_name() + ':' + __name__ + ': AddTrajectory took too long to start arm motion');
+      return 2;
+    
+    if (preempt_requested_fcn and preempt_requested_fcn()):
+      return -1;
+    
+    if (short_circuit_fcn and short_circuit_fcn()):
+      return -2;
+
+    if rospy.is_shutdown():
+      return -3
+    
+    rospy.sleep(0.001)
+    
+  # wait for it to move through the trajectory
+  t0 = rospy.Time().now().to_sec();
+  while (state == pr_msgs.WAMState.state_traj_active or \
+           state == pr_msgs.WAMState.state_traj_stalled):
+    
+    dt = rospy.Time().now().to_sec() - t0; 
+    if (moveTimeout != None and dt > moveTimeout):
+      rospy.logwarn(rospy.get_name() + ':' + __name__ + ': timeout on move after %0.3f sec' % (dt));
+      return -3;
+
+    if (preempt_requested_fcn and preempt_requested_fcn()):
+      return -1;
+
+    if (short_circuit_fcn and short_circuit_fcn()):
+      return -2;
+
+    if rospy.is_shutdown():
+      return -3
+    
+    rospy.sleep(0.001)
+
+    # if (state != pr_msgs.WAMState.state_traj_active):
+    #   dp = np.abs(np.array(path[-1]) - positions);
+    #   if np.all(dp < 0.03):
+    #     rospy.logdebug(rospy.get_name() + ':' + __name__ + ': arm reached desired positions');
+    #     break;
+    #   if (dt > moveTimeout):
+    #     rospy.logwarn(rospy.get_name() + ':' + __name__ + ': timeout on move after %0.3f sec' % (dt));
+    #     break;
+  
+  if (not closeTo(path[-1], positions)):
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': arm not close to desired positions')
+    print path
+    print state
+    
+  # clear path marker
+  clear_path_marker();
+
+  return 0;
+
+def get_elbow_fk(jointAngles=None):
+  ''' returns the fk pose of the elbow '''
+  if (jointAngles == None):
+    jointAngles = positions.copy();
+
+  ps = geometry_msgs.PoseStamped();
+  try:
+    resp = GetFK(inputJointAngles=jointAngles); 
+    ps = resp.elbow;
+  except rospy.ServiceException as err:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': GetFK service request failed: %s' % err);
+
+  return ru.transformPose(ru.BASE_FRAME, ps);
+
+
+def get_fk(jointAngles=None, stamp=rospy.Time(), frame=WRIST_FRAME):
+  ''' returns the pose stamped message for the arm FK '''
+  if jointAngles == None:
+    #ps = geometry_msgs.PoseStamped(rospy.Header(0, stamp, frame), ru.to_Pose([0,0,0], [0,0,0,1]));
+    ps = ru.to_PoseStamped(None, None, frame_id=frame);
+    return ru.transformPose(ru.BASE_FRAME, ps);
+  else:
+    jointAngles = ru.to_array(jointAngles);
+
+    ps = geometry_msgs.PoseStamped();
+    try:
+      resp = GetFK(inputJointAngles=jointAngles); 
+      ps = resp.result;
+    except rospy.ServiceException as err:
+      rospy.logerr(rospy.get_name() + ':' + __name__ + ': GetFK service request failed: %s' % err);
+
+    return ru.transformPose(ru.BASE_FRAME, ps);
+    
+
+def get_ik(wristPose, referenceJointAngles=None, fingerPositions=None, fingerSecondaryPositions=None, checkCollisions=True, weights=np.ones(ARM_DOF), returnAllSolutions=False):
+  ''' 
+    Finds the Inverse Kinematics solution for the given wrist pose
+
+    referenceJointAngles are the joint angles used when determining the ik best solution
+    checkCollisions - True if you want the check if the solutions are in collision
+    weights are the weights used per joint when determining the best ik solution
+    returnAllSolutions - True if you want all valid solutions. If False only the best solution will be returned
+
+    If referenceJointAngles are not provided, the current arm positions are used.
+    If fingerPositions are not provided, the current finger positions are used.
+    If fingerSecondaryPositions are not provided, the current finger secondary positions are used.
+
+    return: (status, solutions);
+      status:
+        -1 = service call failed
+         0 = no errors
+         1 = outside reachable workspace
+         2 = in collision
+  '''
+  # formate pose message
+  wristPose = ru.to_PoseStamped(wristPose);
+
+  # get current joint positions if not provided
+  if (referenceJointAngles == None):
+    referenceJointAngles = copy.deepcopy(positions); 
+    
+  # convert to flat list
+  if (type(referenceJointAngles) == WAM_msgs.SetJointPositions or type(referenceJointAngles) == WAM_msgs.ArmPositions):
+    referenceJointAngles = copy.deepcopy(referenceJointAngles.wamPositions)
+  elif (type(referenceJointAngles) == pr_msgs.Joints):
+    referenceJointAngles = copy.deepcopy(referenceJointAngles.j)
+    
+  if (fingerPositions == None):
+    fingerPositions = Hand.positions.copy();
+  if (fingerSecondaryPositions == None):
+    fingerSecondaryPositions = Hand.secondaryPositions.copy();
+
+
+  if rospy.get_param('/debug', False):
+    rospy.loginfo(rospy.get_name() + ':' + __name__ + ': Sending GetIK Service request:\nwristPose:\n%s\nreferenceJointAngles:\n%s\nfingerPositions:\n%s\nfingerSecondaryPositions:\n%s\ncheckCollisions:\n%s\nweights:\n%s' 
+                    % (wristPose, referenceJointAngles, fingerPositions, fingerSecondaryPositions, checkCollisions, weights));
+
+  try:
+    resp = GetIK(target=wristPose, 
+                  referenceJointAngles=referenceJointAngles,
+                  finger_positions=fingerPositions,
+                  finger_secondary_positions=fingerSecondaryPositions,
+                  checkObstacleCollision=checkCollisions,
+                  weights=weights);
+  except rospy.ServiceException as err:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': GetIK service request failed: %s' % err);
+    return (-1, []);
+
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': get_ik: %s' % IK_STATUS.get(resp.status, 'unkown status'));
+
+  if returnAllSolutions:
+    return (resp.status, resp.resultJointAngles);
+  else:
+    return (resp.status, [] if resp.status != 0 else resp.resultJointAngles.pop(0));
+
+
+def get_lowest_finger_point(referenceJointAngles=None, fingerPositions=None, fingerSecondaryPositions=None, includeWrist=False):
+  ''' returns the lowest point on the fingers in the collision world '''
+  # get current joint positions if not provided
+  if (referenceJointAngles == None):
+    referenceJointAngles = positions.copy(); 
+  if (fingerPositions == None):
+    fingerPositions = Hand.positions.copy();
+  if (fingerSecondaryPositions == None):
+    fingerSecondaryPositions = Hand.secondaryPositions.copy();
+
+  if rospy.get_param('/debug', False):
+    rospy.loginfo(rospy.get_name() + ':' + __name__ + ': Sending GetLowestFingerPoint Service request:\nreferenceJointAngles:\n%s\nfingerPositions:\n%s\nfingerSecondaryPositions:\n%s' 
+                    % (referenceJointAngles, fingerPositions, fingerSecondaryPositions));
+
+  if includeWrist:
+    try:
+      resp = GetLowestWristPoint(inputJointAngles=referenceJointAngles,
+                                  finger_positions=fingerPositions,
+                                  finger_secondary_positions=fingerSecondaryPositions);
+    except rospy.ServiceException, e:
+      rospy.logerr(rospy.get_name() + ':' + __name__ + ': GetLowestWristPoint service request failed');
+      return 0.0;
+  else:
+    try:
+      resp = GetLowestFingerPoint(inputJointAngles=referenceJointAngles,
+                                  finger_positions=fingerPositions,
+                                  finger_secondary_positions=fingerSecondaryPositions);
+    except rospy.ServiceException, e:
+      rospy.logerr(rospy.get_name() + ':' + __name__ + ': GetLowestFingerPoint service request failed');
+      return 0.0;
+
+  return resp.result;
+
+def get_lowest_elbow_point(referenceJointAngles=None, fingerPositions=None, fingerSecondaryPositions=None):
+  ''' returns the lowest point on the elbow in the collision world '''
+  # get current joint positions if not provided
+  if (referenceJointAngles == None):
+    referenceJointAngles = positions.copy(); 
+  if (fingerPositions == None):
+    fingerPositions = Hand.positions.copy();
+  if (fingerSecondaryPositions == None):
+    fingerSecondaryPositions = Hand.secondaryPositions.copy();
+
+  if rospy.get_param('/debug', False):
+    rospy.loginfo(rospy.get_name() + ':' + __name__ + ': Sending GetLowestFingerPoint Service request:\nreferenceJointAngles:\n%s\nfingerPositions:\n%s\nfingerSecondaryPositions:\n%s' 
+                    % (referenceJointAngles, fingerPositions, fingerSecondaryPositions));
+
+  try:
+    resp = GetLowestElbowPoint(inputJointAngles=referenceJointAngles,
+                                finger_positions=fingerPositions,
+                                finger_secondary_positions=fingerSecondaryPositions);
+  except rospy.ServiceException, e:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': GetLowestElbowPoint service request failed');
+    return 0.0;
+
+  return resp.result;
+
+
+
+def rrt_star(finalJointAngles, initialJointAngles=None, fingerPositions=None, fingerSecondaryPositions=None, maxTime=8.0):
+  ''' 
+    RRT* Planner service interface
+    Attempts find a collision free path from the initialJointAngles to the finalJointAngles
+
+    If initialJointAngles are not provided, the current arm positions are used. 
+    If fingerPositions are not provided, the current finger positions are used.
+    If fingerSecondaryPositions are not provided, the current finger secondary positions are used.
+
+    The planner will timeout after maxTime seconds.
+
+    return: (status, path);
+      status:
+        -1 = service call failed
+         0 = no errors
+         2 = unable to set RRT* parameters
+         3 = invalid start position
+         4 = invalid goal position
+         5 = planner timed out
+  '''
+  # get current joint positions if not provided
+  if (initialJointAngles == None):
+    initialJointAngles = positions.copy(); 
+  
+  # convert to flat list
+  if (type(initialJointAngles[0]) == WAM_msgs.SetJointPositions or type(initialJointAngles[0]) == WAM_msgs.ArmPositions):
+    initialJointAngles = map(lambda x: list(x.wamPositions), initialJointAngles)
+  elif (type(initialJointAngles[0]) == pr_msgs.Joints):
+    initialJointAngles = map(lambda x: list(x.j), initialJointAngles)
+
+  if (fingerPositions == None):
+    fingerPositions = Hand.positions.copy();
+  if (fingerSecondaryPositions == None):
+    fingerSecondaryPositions = Hand.secondaryPositions.copy();
+
+  initialJointAngles = ru.to_array(initialJointAngles);
+  finalJointAngles = ru.to_array(finalJointAngles);
+
+  if rospy.get_param('/debug', False):
+    rospy.loginfo(rospy.get_name() + ':' + __name__ + ': Sending RRTStar Service request:\nfinalJointAngles:\n%s\ninitialJointAngles:\n%s\nfingerPositions:\n%s\nfingerSecondaryPositions:\n%s\nmaxTime:\n%s'
+                    % (finalJointAngles, initialJointAngles, fingerPositions, fingerSecondaryPositions, maxTime));
+    
+  # set led to indicate planning
+  led.set_right('b');
+
+  try:
+    resp = RRTStarPlan(initialJointAngles=initialJointAngles, 
+                        finalJointAngles=finalJointAngles, 
+                        finger_positions=fingerPositions,
+                        finger_secondary_positions=fingerSecondaryPositions,
+                        maxTime=maxTime);
+  except rospy.ServiceException as err:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': RRTStar service request failed: %s' % err);
+    return (-1, []);
+
+  # turn led off when done planning
+  led.set_right('k');
+
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': rrt_star: %s' % RRT_STATUS.get(resp.status, 'unkown status'));
+
+  return (resp.status, resp.resultJointAngles);
+
+
+def plan_path(pose, 
+              initialJointAngles=None, 
+              fingerPositions=None, 
+              fingerSecondaryPositions=None, 
+              weights=np.ones(ARM_DOF), 
+              maxTime=8.0):
+  ''' 
+    convience wrapper around ik and rrt planner
+
+    return ((ikStatus, rrtStatus), path)
+    * see get_ik and rrt_star for status explanations
+  '''
+  ps = ru.to_PoseStamped(pose);
+
+  # get current joint positions if not provided
+  if (initialJointAngles == None):
+    initialJointAngles = copy.deepcopy(positions);
+    
+  if (type(initialJointAngles) == WAM_msgs.SetJointPositions or type(initialJointAngles) == WAM_msgs.ArmPositions):
+    initialJointAngles = copy.deepcopy(initialJointAngles.wamPositions)
+  elif (type(initialJointAngles) == pr_msgs.Joints):
+    initialJointAngles = copy.deepcopy(initialJointAngles.j)
+
+  if (fingerPositions == None):
+    fingerPositions = Hand.positions.copy();
+  if (fingerSecondaryPositions == None):
+    fingerSecondaryPositions = Hand.secondaryPositions.copy();
+
+  publish_planning_pose(ps);
+  
+  (ikStatus, ik) = get_ik(ps, 
+                          referenceJointAngles=initialJointAngles, 
+                          fingerPositions=fingerPositions, 
+                          fingerSecondaryPositions=fingerSecondaryPositions, 
+                          checkCollisions=True, 
+                          weights=weights,
+                          returnAllSolutions=False);
+
+  if ikStatus != 0:
+    if rospy.get_param('/debug', False):
+      rospy.loginfo(rospy.get_name() + ':' + __name__ + ': path_plan: IKPlan unable to find valid configuration for pose:\n%s' % ps);
+    clear_planning_pose();
+    return ((ikStatus, -1), []);
+
+  (rrtStatus, rrt) = rrt_star(finalJointAngles=ik, 
+                              initialJointAngles=initialJointAngles, 
+                              fingerPositions=fingerPositions, 
+                              fingerSecondaryPositions=fingerSecondaryPositions, 
+                              maxTime=maxTime);
+  if rrtStatus != 0:
+    if rospy.get_param('/debug', False):
+      rospy.loginfo(rospy.get_name() + ':' + __name__ + ': path_plan: RRTStar unable to find obstacle free trajectory from:\n%s\nto:\n%s' % (initialJointAngles, ik));
+    clear_planning_pose();
+    return ((ikStatus, rrtStatus), []);
+    
+  clear_planning_pose();
+
+  return ((ikStatus, rrtStatus), rrt);
+
+
+def plan_multiple_paths(pose, 
+                        initialJointAngles=None, 
+                        fingerPositions=None, 
+                        fingerSecondaryPositions=None, 
+                        weights=np.ones(ARM_DOF), 
+                        maxTime=8.0,
+                        skip=2):
+  ''' 
+    convience wrapper around ik and rrt planner
+    
+    skip will skip this many ik results
+    
+    return ((ikStatus, [rrtStatus]), [paths])
+    
+    * see get_ik and rrt_star for status explanations
+  '''
+  ps = ru.to_PoseStamped(pose);
+
+  # get current joint positions if not provided
+  if (initialJointAngles == None):
+    initialJointAngles = copy.deepcopy(positions);
+    
+  if (type(initialJointAngles) == WAM_msgs.SetJointPositions or type(initialJointAngles) == WAM_msgs.ArmPositions):
+    initialJointAngles = copy.deepcopy(initialJointAngles.wamPositions)
+  elif (type(initialJointAngles) == pr_msgs.Joints):
+    initialJointAngles = copy.deepcopy(initialJointAngles.j)
+
+  if (fingerPositions == None):
+    fingerPositions = Hand.positions.copy();
+  if (fingerSecondaryPositions == None):
+    fingerSecondaryPositions = Hand.secondaryPositions.copy();
+
+  publish_planning_pose(ps);
+  
+  (ikStatus, iks) = get_ik(ps, 
+                           referenceJointAngles=initialJointAngles, 
+                           fingerPositions=fingerPositions, 
+                           fingerSecondaryPositions=fingerSecondaryPositions, 
+                           checkCollisions=True, 
+                           weights=weights,
+                           returnAllSolutions=True);
+
+  if ikStatus != 0:
+    if rospy.get_param('/debug', False):
+      rospy.loginfo(rospy.get_name() + ':' + __name__ + ': plan_multiple_paths: IKPlan unable to find valid configuration for pose:\n%s' % ps);
+    clear_planning_pose();
+    return ((ikStatus, -1), []);
+  
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': plan_multiple_paths: got %d ik solutions' % len(iks))
+  
+  rrtstats = []
+  paths = []
+  count = 0
+
+  if skip <= 0:
+    skip = 1
+
+  for ik in iks:
+    count += 1
+    if count % skip:
+      (rrtStatus, rrt) = rrt_star(finalJointAngles=ik, 
+                                  initialJointAngles=initialJointAngles, 
+                                  fingerPositions=fingerPositions, 
+                                  fingerSecondaryPositions=fingerSecondaryPositions, 
+                                  maxTime=maxTime);
+      if rrtStatus == 0:
+        rrtstats.append(rrtStatus)
+        paths.append(rrt)
+
+  clear_planning_pose();
+  return ((ikStatus, rrtstats), paths);
+
+
+def ik_preplan(poses):
+  '''
+  poses = a list of geometry_msgs/PoseStamped
+  this function calls the ik_preplanner service which will choose good IK solutions for each of the poses.
+
+  returns a list of joint angles, pr_msgs/Joints[], one for each pose.
+  if the IK preplanner fails, this list will be empty
+  '''
+  # call the IK preplanning server with these poses
+  resp = IKPreplanner(poses=poses)
+  if resp.status == 0:
+    return resp.resultJointAngles
+  # otherwise, failed!
+  return []
+  
+
+
+def plan_multi_ikpath(poses,
+                      initialJointAngles, 
+                      fingerPositions=None, 
+                      fingerSecondaryPositions=None,
+                      weights=np.ones(ARM_DOF), 
+                      maxTime=10.0):
+  '''
+  poses = a list of geometry_msgs/PoseStamped
+  initialJointAngles = required, the current joint angles of the arm
+  weights, maxTime = parameters for the rrt planner
+
+  returns a tuple: (path_to_first_pose, list_of_joint_angles)
+  there will be one set of joint angles for each pose, but if there is no solution, returns []
+  '''
+  ikp = ik_preplan(poses)
+  if len(ikp) == 0:
+    return ([], [])
+
+
+  # get the finger positions if they aren't specified
+  if (fingerPositions == None):
+    fingerPositions = Hand.positions.copy();
+  if (fingerSecondaryPositions == None):
+    fingerSecondaryPositions = Hand.secondaryPositions.copy();
+
+  # first solve for joint angles that aren't in collision using the ik preplanner joint angles as a seed
+  (ikStatus, ik) = get_ik(poses[0], 
+                          referenceJointAngles=ikp[0], 
+                          fingerPositions=fingerPositions, 
+                          fingerSecondaryPositions=fingerSecondaryPositions, 
+                          checkCollisions=True, 
+                          weights=weights,
+                          returnAllSolutions=False);
+  if ikStatus != 0:
+    if rospy.get_param('/debug', False):
+      rospy.loginfo(rospy.get_name() + ':' + __name__ + ': plan_multi_ikpath: IKPlan unable to find valid configuration for pose:\n%s' % poses[0]);
+    return ([], [])
+
+  # plan to the joint angles for the first pose
+  publish_planning_pose(poses[0]);
+  (rrtStatus, rrt) = rrt_star(finalJointAngles=ik, 
+                              initialJointAngles=initialJointAngles, 
+                              fingerPositions=fingerPositions, 
+                              fingerSecondaryPositions=fingerSecondaryPositions, 
+                              maxTime=maxTime)
+  if rrtStatus != 0:
+    if rospy.get_param('/debug', False):
+      rospy.loginfo(rospy.get_name() + ':' + __name__ + ': plan_multi_ikpath: RRTStar unable to find obstacle free trajectory from:\n%s\nto:\n%s' % (initialJointAngles, ik));
+    clear_planning_pose();
+    return ([], ikp);
+    
+  clear_planning_pose();
+
+  return (rrt, ikp)
+
+
+def plan_complex_path(poses,
+                      initialJointAngles=None, 
+                      weights=np.ones(ARM_DOF), 
+                      maxTime=10.0,
+                      stopOnError=True):
+  '''
+  pass in a list of poses, will return a path through all of them.
+  if stopOnError is true, the path returned will be empty if any of the poses returns an error.
+  if stopOnError is false, that waypoint that causes the fault will be skipped.
+  '''
+  
+  path_status = []
+  path = []
+
+  if initialJointAngles == None:
+    angles = copy.deepcopy(initialJointAngles)
+  else:
+    angles = copy.deepcopy(positions)
+
+  # convert to flat list
+  if (type(angles) == WAM_msgs.SetJointPositions or type(angles) == WAM_msgs.ArmPositions):
+    angles = copy.deepcopy(angles.wamPositions)
+  elif (type(angles) == pr_msgs.Joints):
+    angles = copy.deepcopy(angles.j)
+
+  for pose in poses:
+    print 'initialJointAngles',angles
+    point_data = plan_path(pose, initialJointAngles=angles, weights=weights, maxTime=maxTime)
+    path_status.append(point_data[0])
+    path.extend(point_data[1])
+
+    if rospy.get_param('/debug', False):
+        rospy.loginfo(rospy.get_name() + ':' + __name__ + ': plan_complex_path: appending path of length %d' % len(point_data[1]));
+
+    if len(point_data[1]) == 0 and stopOnError:
+      if rospy.get_param('/debug', False):
+        rospy.loginfo(rospy.get_name() + ':' + __name__ + ': plan_complex_path: got an empty path');
+      return (path_status, path)
+    
+    if len(path) > 0:
+      angles = copy.deepcopy(path[-1])
+    
+  return (path_status, path)
+      
+
+def plan_grasp(grasp, initialJointAngles=None, weights=np.ones(ARM_DOF), usePreshape=False, maxTime=8.0, obj=None):
+  '''
+    convience wrapper to plan to a grasp message object
+
+    return ((ikStatus, rrtStatus), path)
+  '''
+  # get current joint positions if not provided
+  if (initialJointAngles == None):
+    initialJointAngles = positions.copy(); 
+  fingerPositions = grasp.preshape if usePreshape else None;
+
+  # get offset from grasp
+  offset = grasp.calib_offset;
+
+  # adjust planar wrist pose
+  wp = copy.deepcopy(grasp.wristPose);
+  wp.pose.position.x += offset.x;
+  wp.pose.position.y += offset.y;
+
+  if (obj != None):
+    # copy struct
+    objcpy = copy.deepcopy(obj);
+    # adjust planar object pose
+    objcpy.pose.pose.position.x += offset.x;
+    objcpy.pose.pose.position.y += offset.y;
+    # add to collision model
+    wm.remove_by_name(objcpy.name);
+    wm.add_from_obj_msg(objcpy);
+
+  return plan_path(wp, initialJointAngles=initialJointAngles, fingerPositions=fingerPositions, weights=weights, maxTime=maxTime);
+
+
+def angle_between_points(a, b, c):
+  '''
+  Returns the absolute angle between the 2 vectors constructed from the 3 
+  passed in points.  Point b should be between a and c.  if the points
+  are co-linear, the returned angle will be close to 0.
+  '''
+  # convert pr_msgs.Joints() to a standard np.array
+  a = ru.to_array(a)
+  b = ru.to_array(b)
+  c = ru.to_array(c)
+  
+  v1 = b - a
+  v2 = c - a
+  tmp = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+  # cap and -1 and 1 to avoid math.acos() errors
+  tmp = min(tmp, 1)
+  tmp = max(tmp, -1)
+  return math.acos(tmp)
+
+def simplify_path(path, threshold=0.0001):
+  '''
+  Takes an arm path and throws out the points which are co-linear in joint 
+  space. This provides a much better way of determining the shortest path of
+  the RRT* output.
+  
+  path is a list of pr_msgs.Joints() types. or a list of list of joint angles.
+
+  threshold is how the angular distance (in radians) between a set of 3 points 
+  for them to be considered co-linear.  default=0.0001.
+  
+  returns the simplified path.
+  '''
+  if len(path) < 3:
+    return path
+  simple_path = []
+
+  point_a = 0
+  point_b = 1
+  point_c = 2
+  # always keep first point
+  simple_path.append(path[0])
+    
+  while point_c < len(path):
+    angle = angle_between_points(path[point_a], path[point_b], path[point_c])
+    if angle > threshold:
+      # points are NOT co-linear
+      # keep b, increment a, b, and c
+      simple_path.append(path[point_b])
+      point_a += 1
+      point_b += 1
+      point_c += 1
+    else:
+      # points are co-linear
+      # throw out b, increment b and c
+      point_b += 1
+      point_c += 1
+    # end if
+  # end while
+            
+  # always keep last point
+  simple_path.append(path[-1])
+  return simple_path
+
+def path_length(path):
+  '''
+  return the length of this path in joint space
+  '''
+  
+  if path == None:
+    return 0.0
+  if len(path) < 2:
+    return 0.0
+
+  # convert to flat list
+  if (type(path[0]) == WAM_msgs.SetJointPositions or type(path[0]) == WAM_msgs.ArmPositions):
+    mypath = map(lambda x: list(x.wamPositions), path)
+  elif (type(path[0]) == pr_msgs.Joints):
+    mypath = map(lambda x: list(x.j), path)
+  else:
+    mypath = path
+
+  length = 0.0
+  for i in range(len(mypath)-1):
+    s = 0.0
+    for j in range(len(mypath[i])):
+      s += (mypath[i][j] - mypath[i+1][j]) * (mypath[i][j] - mypath[i+1][j])
+    length += np.sqrt(s)
+  return length
+
+
+def plan_best_grasp(grasps, initialJointAngles=None, weights=np.ones(ARM_DOF), usePreshape=False, maxTimePerPlan=8.0, obj=None, min_length=0, preempt_requested_fcn=None):
+  '''
+    plans to the best grasp in the list of grasps based on quality and path length
+    grasps - list of Grasp messages
+    obj - Perception_msgs/Object message of the object you are planning around
+    
+    min_length: if a path is found that simplifies to less than this number of waypoints,
+    then it will be returned immediately.
+
+    logic:
+     1. sort grasps based on quality, start with the highest quality set.
+     2. sort grasps based on distance to current hand position, start with closest.
+     3. if a simplified path is found with length <= to min_length, it is returned immediately
+     4. return shortest simplified path    
+
+    return tuple (grasp, path) -- (None, None) if no possible grasps
+  '''
+
+  # get current joint positions if not provided
+  if (initialJointAngles == None):
+    initialJointAngles = positions.copy(); 
+
+  # cast grasps as a numpy array
+  grasps = np.array(grasps);
+
+  # array of grasp qualities to make computation easier
+  graspQualities = np.array(map(lambda g: g.quality, grasps), dtype='object');
+  
+
+  # for quality level (largest -> smallest)
+  uniqueQualities = np.sort(np.unique(graspQualities));
+  for quality in uniqueQualities[::-1]:
+    
+    if (preempt_requested_fcn and preempt_requested_fcn()):
+      return (None, None)
+      
+    # get grasps for this quality level
+    cgrasps = grasps[graspQualities == quality];
+    rospy.loginfo(rospy.get_name() + ':' + __name__ + ': planning %d grasp poses for quality %f' % (len(cgrasps), quality));
+    
+    # get distances to hand
+    handkdl = ru.to_KDLVector(get_fk(jointAngles=initialJointAngles))
+    dists = []
+    for g in cgrasps:
+      d = (ru.to_KDLVector(g.wristPose) - handkdl).Norm()
+      dists.append(d)
+    
+    # sort based on hand dist    
+    tmp = zip(dists,cgrasps)
+    tmp.sort()   
+    dists, dgrasps = zip(*tmp)
+    dgrasps = np.array(dgrasps)
+
+    # publish grasps display 
+    publish_grasp_poses(dgrasps);
+    
+    # plan to each grasp pose 
+    plans = []
+    for g in dgrasps:
+      ((ikStatus, rrtStatus), path) = plan_grasp(g, initialJointAngles=initialJointAngles, weights=weights, usePreshape=usePreshape, maxTime=maxTimePerPlan, obj=obj)
+      
+      if (preempt_requested_fcn and preempt_requested_fcn()):
+        return (None, None)
+
+      # simplify path here
+      if path != None and len(path) > 0:
+        spath = simplify_path(path)
+        plans.append(((ikStatus, rrtStatus), spath))
+        
+        # short circuit
+        if len(spath) > 0 and len(spath) <= min_length:
+          clear_grasp_poses();
+          return (g, spath)
+      
+    # planResults is array of bool (True if successful)
+    planResults = np.array(map(lambda p: (p[0][0] == 0 and p[0][1] == 0), plans)); # ikStatus and rrtStatus must both be 0
+    paths = np.array(map(lambda p: p[1], plans), dtype='object');
+
+    # clear grasps display
+    clear_grasp_poses();
+
+    if np.any(planResults):
+      # at least one plan was successful
+      successfulGrasps = dgrasps[planResults];
+      successfulPaths = paths[planResults];
+      
+      #print "lengths of successful paths: " + str(map(len, successfulPaths))
+      #print "lengths of simplified successful paths: " + str(map(len, simplifiedPaths))
+      
+      # find shortest path
+      ishortestPath = np.argmin(map(len, successfulPaths));
+
+      # return best grasp
+      return (successfulGrasps[ishortestPath], successfulPaths[ishortestPath]);
+    # end if any plan results
+  # end for each grasp quality
+
+  # no grasps were possible 
+  return (None, None);
+
+
+def plan_paths(poses, initialJointAngles=None, fingerPositions=None, fingerSecondaryPositions=None, weights=np.ones(ARM_DOF), maxTime=8.0, min_length=0):
+  '''
+    plans to all poses in the list
+    poses: list of wrist poses to plan to
+    
+    min_length: if a path is found that simplifies to less than this number of waypoints,
+    then it will be returned immediately.
+    
+    return tuple (shortest_path, plans)
+      plans is the list of status/path tuple from plan_path for each pose
+      shortes_path is the shortest valid path found
+  '''
+  # plan to each pose
+  #plans = map(lambda pose: plan_path(pose, initialJointAngles, fingerPositions, fingerSecondaryPositions, weights, maxTime=8.0), poses);
+  
+  plans = []
+  for pose in poses:
+    #plan: ((ikStatus, rrtStatus), path)
+    plan = plan_path(pose, initialJointAngles, fingerPositions, fingerSecondaryPositions, weights, maxTime=8.0)
+    plans.append(plan)
+    if plan[1]:
+      newpath = simplify_path(plan[1])
+      if len(newpath) > 0 and len(newpath) <= min_length:
+        return (len(plans)-1, plans)
+    
+  # array of paths
+  apaths = np.array(map(lambda p: p[1], plans), 'object');
+  pathLens = np.array(map(len, apaths));
+  ivalidPaths = pathLens > 0;
+  if np.any(ivalidPaths):
+    ishortestPath = np.nonzero(ivalidPaths)[0][np.argmin(pathLens[ivalidPaths])];
+  else:
+    # no valid paths
+    ishortestPath = -1;
+
+  return (ishortestPath, plans);
+
+
+def publish_grasp_poses(grasps):
+  ''' publish the grasps poses as a pose array '''
+  pa = geometry_msgs.PoseArray(header=ru.header(stamp=rospy.Time.now()));
+  pa.poses = [g.wristPose.pose for g in grasps];
+  graspPosesPub.publish(pa);
+
+
+def clear_grasp_poses():
+  ''' clears the grasp poses display '''
+  pa = geometry_msgs.PoseArray(header=ru.header(stamp=rospy.Time.now()));
+  graspPosesPub.publish(pa);
+
+
+def publish_planning_pose(pose):
+  ''' publish a pose message for pose we are planning to '''
+  newpose = ru.to_PoseStamped(pose, stamp=rospy.Time().now(), frame_id=ru.BASE_FRAME);
+  planningPosePub.publish(newpose);
+
+
+def clear_planning_pose():
+  ''' clears the planning pose published message '''
+  ps = ru.to_PoseStamped(stamp=rospy.Time().now(), frame_id=ru.BASE_FRAME);
+  planningPosePub.publish(ps);
+
+
+def publish_path_marker(path):
+  ''' publish a line marker for the given path '''
+  # TODO: implement path marker publisher
+  lineMarker = visualization_msgs.Marker();
+  lineMarker.id = 0;
+  lineMarker.header.frame_id = ru.BASE_FRAME;
+  lineMarker.header.stamp = rospy.Time().now();
+  lineMarker.scale.x = 0.02;
+  lineMarker.color = std_msgs.ColorRGBA(0.0, 1.0, 0.0, 1.0);
+  lineMarker.lifetime = rospy.Duration(60.0);
+  lineMarker.type = lineMarker.LINE_STRIP;
+  lineMarker.action = lineMarker.ADD;
+
+  # add line points
+  for jp in path:
+    wps = get_fk(jointAngles=jp);
+    lineMarker.points.append(wps.pose.position);
+
+  # publish marker
+  pathMarkerPub.publish(lineMarker);
+
+def clear_path_marker():
+  ''' removes the arm path line marker '''
+  lineMarker = visualization_msgs.Marker();
+  lineMarker.id = 0;
+  lineMarker.type = lineMarker.LINE_STRIP;
+  lineMarker.header.frame_id = ru.BASE_FRAME;
+  lineMarker.header.stamp = rospy.Time().now();
+  lineMarker.action = lineMarker.DELETE;
+
+  pathMarkerPub.publish(lineMarker);
+  
+
+def cleanup():
+  ''' this is designed to be called for preempts '''
+  if not rospy.get_param('/fake_hand', False):
+    clear_mass();
+  cancel_trajectory();
+  set_stiffness(0);
+  clear_path_marker();
+  clear_grasp_poses();
+
+def closeTo(a, b):
+  '''
+  copy of OWD TrajType::closeto()
+  tests if two joint arrays are 'close enough'.
+  '''
+  if len(a) != len(b):
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': joint arrays are different lengths');
+    return False;
+  
+  for i in range(len(a)):
+    if ((i<3) and (abs(a[i] - b[i]) > 0.1)): 
+      return False;  # J1-J3
+    elif ((i==3) and (abs(a[i] - b[i]) > 0.2)):
+      return False; # J4
+    elif ((i>3) and (abs(a[i] - b[i]) > 0.4)):
+      return False; # J5-7
+  return True;
+
+
+def owd_dh():
+  ''' copy of owd DH parameters for the arm '''
+  # alpha, a, d, theta
+  links = ( (    0.0000,   0.0000,   0.0000,   0.0000),
+            (-np.pi/2.0,   0.0000,   0.0000,   0.0000),
+            ( np.pi/2.0,   0.0000,   0.0000,   0.0000),
+            (-np.pi/2.0,   0.0450,   0.5500,   0.0000),
+            ( np.pi/2.0,  -0.0450,   0.0000,   0.0000),
+            (-np.pi/2.0,   0.0000,   0.3000,   0.0000),
+            ( np.pi/2.0,   0.0000,   0.0000,   0.0000),
+            (    0.0000,   0.0000,   0.1800,   0.0000));
+
+  dh = map(lambda l: kine.DH(*l), links);
+
+  return dh;
+
+def velocity(velocities, nsecs=None, stop_requested_fcn=None):
+  ''' 
+  set joint velocities.
+  
+  if nsecs or stop_requested_fcn are specified, then this function will block until
+  either the time is up, or the stop_requested_fcn returns true.
+  
+  else, you will have to call this function repeatedly at a rate of more than 100 hz
+  or the velocity move will time out and the arm will stop.
+  
+  velocities is a list of floats of joint velocities in radians/sec.
+  nsecs is how many seconds to apply velocity for.
+  '''
+  
+  if len(velocities) != 7:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': velocities vector must be length 7');
+    return -1
+  
+  msg = pr_msgs.Servo()
+  msg.joint = list(range(1,8))
+  msg.velocity = velocities
+  
+  wamServoPub.publish(msg)
+  
+  if nsecs != None or stop_requested_fcn != None:
+    t0 = rospy.Time().now().to_sec();
+    
+    while not rospy.is_shutdown():
+      if (rospy.Time().now().to_sec() - t0 >= nsecs):
+        return 0
+      if (stop_requested_fcn and stop_requested_fcn()):
+        return 1
+      wamServoPub.publish(msg)
+      rospy.sleep(0.01)
+  return 0;
+
+def wrist_flip_in_path(path):
+  '''
+  test if the given path has a "wrist flip" in it.
+  '''
+  
+  # convert to flat list
+  if (type(path[0]) == WAM_msgs.SetJointPositions or type(path[0]) == WAM_msgs.ArmPositions):
+    mypath = map(lambda x: list(x.wamPositions), path)
+  elif (type(path[0]) == pr_msgs.Joints):
+    mypath = map(lambda x: list(x.j), path)
+  else:
+    mypath = path
+  
+  d5 = mypath[0][4] - mypath[-1][4];
+  d7 = mypath[0][6] - mypath[-1][6];
+  
+  if abs(d5) > np.pi/2.0 and abs(d7) > np.pi/2.0 and np.sign(d5) != np.sign(d7):
+    return True
+  return False
+
+def torque_control(torques, secs, wait=True, preempt_requested_fcn=None, short_circuit_fcn=None): 
+  ''' wrapper for the torque control service '''
+  global TorqueControl, state
+  
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': torque_control with torques: %s, time: %f' % (torques, secs));
+  
+  cancel_trajectory();
+  
+  try:
+    ## send move command
+    resp = TorqueControl(torques, secs)
+  except rospy.ServiceException as err:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': torque_control service request failed: %s' % err);
+    return 1;
+  
+  if (not resp.ok):
+    rospy.logwarn(rospy.get_name() + ':' + __name__ + ': torque_control service not ok: %s' % resp.reason);
+    return 1;
+
+  rospy.loginfo(rospy.get_name() + ':' + __name__ + ': torque_control service ok, id: %d' % resp.id);
+  
+  # wait for it to move through the trajectory
+  if wait:
+    
+    t0 = rospy.Time().now().to_sec();
+    while (state != pr_msgs.WAMState.state_traj_active and
+           state != pr_msgs.WAMState.state_traj_stalled):
+      rospy.sleep(0.01)
+      if rospy.Time().now().to_sec() - t0 > 1.0:
+        break;
+
+    t1 = rospy.Time().now().to_sec();
+
+    #print 'waited for arm state to change from %f to %f ' % (t0, t1)
+    while (state == pr_msgs.WAMState.state_traj_active or 
+           state == pr_msgs.WAMState.state_traj_stalled):
+      
+      dt = rospy.Time().now().to_sec() - t0; 
+
+      if (preempt_requested_fcn and preempt_requested_fcn()):
+        return -1;
+
+      if (short_circuit_fcn and short_circuit_fcn()):
+        return -2;
+      
+      if rospy.is_shutdown():
+        return -3
+      
+      # TODO: timeout?
+      #if (dt > moveTimeout):
+      #  rospy.logwarn(rospy.get_name() + ':' + __name__ + ': timeout on move after %0.3f sec' % (dt));
+      #  break;
+    
+  return 0;
+ 
+  
+def compute_servo_wrist_pose(fiducial, target):
+  ''' 
+    function to compute the new wrist pose based on the relative transform between the curr and target poses
+    B - base frame
+    O - target frame
+    F - wrist fiducial (rigid transform relative to the wrist)
+    W - wrist frame
+    N - new wrist frame
+    given: bTo, bTf, bTw
+    want: bTn
+    
+    ASSUMPTION: F is rigidly attached to wrist -> oTn == fTw -> oTf = I
+
+    fTw = (bTf)^-1 * bTw
+    oTn = (bTo)^-1 * bTn
+    bTn = bTo * oTn
+    
+    bTn = bTo * oTf * (bTf)^-1 * bTw
+  '''
+  bTf = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, ru.to_PoseStamped(fiducial)));
+  bTo = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, ru.to_PoseStamped(target)));
+  bTw = tr.rospose2tr(get_fk());
+  
+  bTn = np.dot(bTo, np.dot(np.linalg.inv(bTf), bTw));
+
+  return ru.to_PoseStamped(bTn);
+
+  ''' cody's method
+  P0 = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, ru.to_PoseStamped(curr)));
+  P1 = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, ru.to_PoseStamped(target)));
+  Pw = tr.rospose2tr(get_fk());
+
+  T01 = np.dot(P1, np.linalg.inv(P0));
+  
+  # new wrist pose
+  nPw = np.dot(T01, Pw);
+
+  return ru.to_PoseStamped(nPw);
+  '''
+
+def adjustForArm(pose, neighborhood=0.15, min_neighbors=2, region=''):
+  '''
+  adjust a position from perception for the arm.
+  pose is anything that can be converted to a ros Pose.
+  returns the adjusted ros Pose.  may be original pose if service had an error.
+  only the position is translated.  the orientation is simply used to designate
+  which dataset to use.  you can pass in the region to override which dataset to use.
+  
+  all points within a 'neighborhood' radius will be used.  if the number of points found
+  is less than 'min_neighbors', the neighborhood is expanded to use exactly this number.  
+  '''
+
+  try:
+    resp = WamCalibrate(pose=ru.to_Pose(pose), 
+                        neighborhood=neighborhood, 
+                        region=region,
+                        min_neighbors=min_neighbors)
+  except Exception as e:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': calibration failed:' + str(e));
+    return ru.to_Pose(pose)
+
+  if not resp.success:
+    rospy.logerr(rospy.get_name() + ':' + __name__ + ': calibration not successful');
+
+  return resp.pose

@@ -1,0 +1,49 @@
+import os
+import sys 
+import time 
+import copy 
+import math 
+import string
+import numpy as np 
+import scipy as sp
+
+import roslib; roslib.load_manifest('scripting_util');
+import rospy
+
+import std_msgs.msg as std_msgs
+import sensor_msgs.msg as sensor_msgs
+import geometry_msgs.msg as geometry_msgs
+import Perception_msgs_upenn.msg as Perception_msgs 
+import task_msgs.msg as task_msgs
+import RosUtil as ru
+import Transform as tr
+
+import Arm
+import Hand
+import Neck
+import Audio 
+import ForceTorque
+import Perception
+import ObjectModel as om
+import WorldModel as wm
+
+
+def reset_globals():
+  ''' resets any shared variables that need to be reset when restarting '''
+  #Perception.candidates[task.object] = [];
+  #Perception.obj = Perception_msgs.Object();
+  #Perception.origObjPose = None;
+  #Perception.graspedObjPose = None;
+
+
+def cleanup():
+  ''' this is designed to be called for preempts '''
+  Arm.cleanup();
+  Hand.cleanup();
+  Neck.cleanup();
+  Audio.cleanup();
+  ForceTorque.cleanup();
+  Perception.cleanup();
+  om.cleanup();
+  wm.cleanup();
+

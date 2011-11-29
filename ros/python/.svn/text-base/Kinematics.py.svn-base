@@ -1,0 +1,72 @@
+import os
+import sys
+import copy
+import numpy as np
+import scipy as sp
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+import PyKDL as kdl
+
+import geometry_msgs.msg as geometry_msgs
+
+import RosUtil as ru
+import Transform as tr
+
+class DH():
+  def __init__(self, alpha, a, d, theta):
+    self.alpha = alpha;
+    self.a = a;
+    self.d = d;
+    self.theta = theta;
+
+    self.sa = np.sin(self.alpha);
+    self.ca = np.cos(self.alpha);
+
+    self.Talpha = tr.rotx(self.alpha);
+    self.Ta = tr.trans(self.a, 0.0, 0.0); 
+    self.Td = tr.trans(0.0, 0.0, self.d); 
+    self.T(self.theta);
+
+  def T(self, theta):
+    ''' get the transform '''
+    self.theta = theta;
+    self.Ttheta = tr.rotz(self.theta);
+
+    self.H = np.dot(self.Ttheta, np.dot(self.Td, np.dot(self.Ta, self.Talpha)));
+
+    return self.H.copy();
+
+
+class WAM():
+  def __init__(self, Tbase2wam=tr.I()):
+    # copy of owd DH parameters for the wam
+    # alpha, a, d, theta
+    self.dhParam = ((    0.0000,   0.0000,   0.0000,   0.0000),
+                    (-np.pi/2.0,   0.0000,   0.0000,   0.0000),
+                    ( np.pi/2.0,   0.0000,   0.0000,   0.0000),
+                    (-np.pi/2.0,   0.0450,   0.5500,   0.0000),
+                    ( np.pi/2.0,  -0.0450,   0.0000,   0.0000),
+                    (-np.pi/2.0,   0.0000,   0.3000,   0.0000),
+                    ( np.pi/2.0,   0.0000,   0.0000,   0.0000),
+                    (    0.0000,   0.0000,   0.1800,   0.0000));
+    self.dh = map(lambda dhp: DH(*dhp), self.dhParam);
+    self.Tbase2wam = Tbase2wam.copy();
+
+    # setup publishers
+    self.linkTopics = map(lambda i: ('l%d' % i), range(len(self.dhParam)));
+    self.linkPublishers = map(lambda p: rospy.Publisher(p, geometry_msgs.PoseStamped, latch=True), self.linkTopics);
+
+
+  def publish(self, positions):
+    ''' publishes the current joint positions as poses '''
+    H = [self.dh[0].T(0.0)];
+    H.extend(map(lambda i: self.dh[i+1].T(positions[i]), range(len(positions))));
+
+    # compute intermediate frames
+    T = self.Tbase2wam;
+    for i in range(len(H)):
+      T = np.dot(T, H[i]);
+      self.linkPublishers[i].publish(ru.to_PoseStamped(T));
+
+

@@ -1,0 +1,292 @@
+import time
+import math
+import sys
+import copy
+import string 
+import numpy as np
+import scipy as sp
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+
+import std_msgs.msg as std_msgs
+import geometry_msgs.msg as geometry_msgs
+
+import BHand_msgs.msg as BHand_msgs
+import hand_kinematics.msg as upenn_hand_kinematics_msgs 
+import PressureSensor_msgs.msg as PressureSensor_msgs
+import ForceTorque_msgs.msg as ForceTorque_msgs
+
+import HandControl_msgs.msg as HandControl_msgs 
+
+import RosUtil
+
+# no python bindings for RE2 enums
+HAND_DOF = 4;
+BHANDMODE_NOTATTACHED = 0;
+BHANDMODE_INITIALIZING = 1;
+BHANDMODE_IDLE = 2;
+BHANDMODE_POSITION_TRPZ = 3;
+BHANDMODE_VELOCITY = 4;
+
+POSITIONS_INNER_ANGLE_MIN = np.array([0.0, 0.0, 0.0, 0.0]) * np.pi/180.0;
+POSITIONS_INNER_ANGLE_MAX = np.array([48.0, 48.0, 48.0, 0.1]) * np.pi/180.0;
+POSITIONS_INNER_ANGLE_RANGE = POSITIONS_INNER_ANGLE_MAX - POSITIONS_INNER_ANGLE_MIN;
+
+POSITIONS_OUTER_ANGLE_MIN = np.array([0.0, 0.0, 0.0, 0.0]) * np.pi/180.0;
+POSITIONS_OUTER_ANGLE_MAX = np.array([140.0, 140.0, 140.0, 180.0]) * np.pi/180.0;
+POSITIONS_OUTER_ANGLE_RANGE = POSITIONS_OUTER_ANGLE_MAX - POSITIONS_OUTER_ANGLE_MIN;
+
+CLOSE_DIR = +1;
+
+velFilterWeight = 0.1;
+tPositions = rospy.Time().to_sec();
+
+# properties = BHand_msgs.BHandProperties();
+strainGauge = np.zeros(HAND_DOF);
+innerVelocities = np.zeros(HAND_DOF);
+outerVelocities = np.zeros(HAND_DOF);
+innerAngles = np.zeros(HAND_DOF);
+outerAngles = np.zeros(HAND_DOF);
+
+
+## subscriber callbacks
+# def HandPropertiesCallback(data):
+#   global properties;
+#   properties = data;
+
+def HandPositionsCallback(data):
+  global tPositions
+  global innerAngles
+  global outerAngles
+  global innerVelocities
+  global outerVelocities
+
+  dt = data.header.stamp.to_sec() - tPositions;
+  
+  if dt > 0: 
+    tPositions = data.header.stamp.to_sec();
+
+    innerVelocities[:] = velFilterWeight * innerVelocities + (1-velFilterWeight) * ((data.bhandInnerLinkPositions - innerAngles)/dt);
+    outerVelocities[:] = velFilterWeight * outerVelocities + (1-velFilterWeight) * ((data.bhandOuterLinkPositions - outerAngles)/dt);
+
+    outerAngles[:] = data.bhandOuterLinkPositions;
+        
+    # after breakaway the inner angles will continue to increase but the outer joint is actually moving
+    # it moves at ~1/3 the rate of what the inner angle moves at relative to the encoders
+    #innerAngles[0:3] = data.bhandInnerLinkPositions[0:3] - 3*outerAngles[0:3];
+    #innerAngles[3] = data.bhandInnerLinkPositions[3];
+    innerAngles[:] = data.bhandInnerLinkPositions;
+
+
+def HandStrainGaugeCallback(data):
+  strainGauge[:] = data.bhandStrainGauge;
+
+
+## setup subscribers
+rospy.logdebug('Hand: Setting up subscribers...');
+# re2 
+# rospy.Subscriber('/RightArm/BHand/bhand_properties', BHand_msgs.BHandProperties, HandPropertiesCallback, None, 1)
+rospy.Subscriber('/RightArm/BHand/bhand_positions', BHand_msgs.BHandPositions, HandPositionsCallback, None, 1)
+rospy.Subscriber('/RightArm/BHand/bhand_strain_gauge', BHand_msgs.BHandStrainGauge, HandStrainGaugeCallback, None, 1)
+
+## setup publishers
+rospy.logdebug('Hand: Setting up publishers...');
+# re2
+handModePub = rospy.Publisher('/RightArm/BHand/set_hand_mode', BHand_msgs.SetHandMode);
+rospy.sleep(0.2);
+positionsPub = rospy.Publisher('/RightArm/BHand/set_hand_positions', BHand_msgs.SetHandPositions);
+rospy.sleep(0.2);
+velocitiesPub = rospy.Publisher('/RightArm/BHand/set_hand_velocities', BHand_msgs.SetHandVelocities);
+rospy.sleep(0.2);
+gotoHomePub = rospy.Publisher('/RightArm/BHand/goto_home_position', BHand_msgs.GotoHomePosition);
+rospy.sleep(0.2);
+
+
+## actionlib connections
+rospy.logdebug('Hand: Setting up actionlib connections...');
+# HandControl
+handControl = RosUtil.actionlib_proxy('hand_control', HandControl_msgs.HandControlAction, not RosUtil.is_sim());
+
+
+def set_mode(mode):
+  ''' sets the hand mode '''
+  handModePub.publish(BHand_msgs.SetHandMode(mode));
+  rospy.sleep(0.2);
+  if (mode == BHANDMODE_VELOCITY):
+    # re2 bug - need to send 0 vel message first
+    stop(); 
+
+def set_pos(desPos=np.array([0, 0, 0, 0]), timeout=5.0):
+  ''' sets the fingers to the given position '''
+  # minimum and maximum finger velocities
+  vmax = np.array([1.0, 1.0, 1.0, 1.0]);
+  vmin = np.array([-1.0, -1.0, -1.0, -1.0]);
+
+  # PID gains
+  kp = np.array([5.0, 50.0, 50.0, 1.0]);
+  kd = np.array([0.0, 0.0, 0.0, 0.0]);
+  ki = np.array([0.5, 0.5, 0.5, 0.0]);
+  ie = np.zeros(HAND_DOF);
+  le = np.zeros(HAND_DOF);
+
+  # loop at 30Hz
+  rate = rospy.Rate(30);
+
+  pe = np.array([np.inf]*HAND_DOF);
+  t0 = rospy.Time().now().to_sec();
+  
+  while (np.any(np.abs(pe) > 0.01) and rospy.Time().now().to_sec() - t0 < timeout):
+    # position error
+    pe = desPos - innerAngles;
+
+    # change in error
+    de = pe - le;
+
+    # integrated error
+    ie += pe;
+
+    # update velocity commands
+    v = kp * pe + ki * ie + kp * de;
+
+    # limit to min and max operating velocities
+    v = np.minimum(vmax, np.maximum(vmin, v));
+
+    # send velocity commands
+    set_vel(v);
+
+    # store last error
+    le = pe.copy();
+
+    rate.sleep();
+
+  stop();
+
+
+def set_vel(vel=np.array([0, 0, 0, 0])):
+  ''' sets the fingers to the given vel '''
+  global velocitiesPub
+
+  set_mode(BHANDMODE_VELOCITY);
+
+  msg = BHand_msgs.SetHandVelocities(vel);
+  velocitiesPub.publish(msg);
+
+def open(vel=np.array([1.0, 1.0, 1.0, 0.0])):
+  ''' open the fingers with a given velocity '''
+  global velocitiesPub
+
+  #if (properties.handMode != BHANDMODE_VELOCITY):
+  set_mode(BHANDMODE_VELOCITY);
+
+  vel = np.array(vel);
+  vel[:3] = -CLOSE_DIR * np.abs(vel[:3]);
+  msg = BHand_msgs.SetHandVelocities(vel);
+  velocitiesPub.publish(msg);
+
+def close(vel=np.array([1.0, 1.0, 1.0, 0.0])):
+  ''' close the fingers with given velocities '''
+  global velocitiesPub
+
+  #if (properties.handMode != BHANDMODE_VELOCITY):
+  set_mode(BHANDMODE_VELOCITY);
+  vel = np.array(vel);
+  vel[:3] = CLOSE_DIR * np.abs(vel[:3]);
+  msg = BHand_msgs.SetHandVelocities(vel);
+  velocitiesPub.publish(msg);
+
+def close_until(vel=np.array([1.0, 1.0, 1.0, 0]), velMin=np.zeros(HAND_DOF)+0.01, strainMax=np.array([np.Inf, np.Inf, np.Inf, np.Inf]), dr=-1.0, timeout=5.0, preempt_requested_fcn=None):
+  ''' close the fingers until the conditions are met '''
+  global innerVelocities
+  #global strainGauge
+  close(vel);
+
+  t0 = rospy.Time().now().to_sec();
+  startupTime = 1.0;
+  while((np.any(np.abs(innerVelocities) > velMin) 
+          #and np.any(np.abs(strainGauge < strainMax))
+          and rospy.Time().now().to_sec() - t0 < timeout)
+          or rospy.Time().now().to_sec() - t0 < startupTime):
+
+    close(vel);
+    if (preempt_requested_fcn and preempt_requested_fcn()):
+      stop()
+      return -1;
+
+    rospy.sleep(0.1);
+    
+  stop();
+  return 0
+
+def zero(vel=np.array([1.0, 1.0, 1.0, 0]), timeout=5.0, preempt_requested_fcn=None):
+  ''' moves the fingers to the zero position (open) '''
+  global innerAngles 
+  cvel = copy.deepcopy(np.array(vel));
+  open(cvel);
+
+  t0 = rospy.Time().now().to_sec();
+  while(rospy.Time().now().to_sec() - t0 < timeout):
+
+    if (preempt_requested_fcn and preempt_requested_fcn()):
+      stop()
+      return -1;
+
+    for i in np.arange(HAND_DOF):
+      if innerAngles[i] < 0.05:
+        cvel[i] = 0;
+    if np.all(cvel[:] < 0.01):
+      break;
+    open(cvel);
+
+    rospy.sleep(0.1);
+    
+  stop();
+  return 0
+
+def fist(vel=np.array([1.0, 1.0, 1.0, 0]), timeout=5.0, preempt_requested_fcn=None):
+  ''' moves the fingers into the fist posisition (closed) '''
+  global innerAngles 
+
+  cvel = copy.deepcopy(np.array(vel));
+  close(cvel);
+
+  t0 = rospy.Time().now().to_sec();
+  while(rospy.Time().now().to_sec() - t0 < timeout):
+
+    if (preempt_requested_fcn and preempt_requested_fcn()):
+      stop()
+      return -1;
+
+    for i in np.arange(HAND_DOF):
+      if innerAngles[i] > (139.0 * (np.pi/180.0)):
+        cvel[i] = 0;
+    if np.all(cvel[:] < 0.01):
+      break;
+    close(cvel);
+
+    rospy.sleep(0.1);
+    
+  stop();
+  return 0
+
+def stop():
+  ''' open the fingers with a given velocity '''
+  global velocitiesPub
+  msg = BHand_msgs.SetHandVelocities([0]*HAND_DOF);
+  velocitiesPub.publish(msg);
+
+
+def hand_control(action):
+  global handControl 
+  action = string.lower(action);
+    
+  if action == 'calibrate':
+    goal = HandControl_msgs.HandControlGoal();
+    goal.command = HandControl_msgs.HandControlGoal.CALIBRATE;
+    handControl.send_goal(goal);
+
+
+def cleanup():
+  ''' this is designed to be called for preempts '''
+  stop();
+

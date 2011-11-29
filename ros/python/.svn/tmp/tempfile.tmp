@@ -1,0 +1,129 @@
+import os
+import io
+import sys 
+import time 
+import copy 
+import math 
+import string 
+import numpy as np 
+import scipy as sp
+
+import roslib; roslib.load_manifest('scripting_util');
+import rospy
+
+import std_msgs.msg as std_msgs
+import sensor_msgs.msg as sensor_msgs
+import geometry_msgs.msg as geometry_msgs
+
+import object_model_msgs.srv as object_model_srvs
+
+import RosUtil as ru
+import Transform as tr
+
+# cache n models
+objScanCacheSize = 3;
+cachedObjScans = {};
+
+## setup services 
+ResolveGrasps = ru.service_proxy('/object_model/resolve_grasps', object_model_srvs.ResolveGrasps, not ru.is_sim());
+GetMass = ru.service_proxy('/object_model/get_mass', object_model_srvs.GetMass, not ru.is_sim());
+GetObjScan = ru.service_proxy('/object_model/get_obj_scan', object_model_srvs.GetObjScan, not ru.is_sim());
+GetObjScan2 = ru.service_proxy('/object_model/get_obj_scan2', object_model_srvs.GetObjScan2, not ru.is_sim());
+
+
+def resolve_grasps(objName, objPose, action='grasp'):
+  ''' gets list of grasp poses for given object pose and action '''
+  try:
+    resp = ResolveGrasps(name=objName,
+                          action=action,
+                          objPose=ru.to_PoseStamped(objPose));
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': resolve_grasps serivce falied: %s' % err);
+    return [];
+
+  return resp.graspList.poses;
+
+
+
+def get_pc_model(name, pose=None, resolution='lores'):
+
+  # is the request point cloud cached
+  k = (name, resolution, sensor_msgs.PointCloud);
+  if (k in cachedObjScans.keys()):
+    pts = cachedObjScans[k].copy(); 
+  else:
+    req = object_model_srvs.GetObjScanRequest();
+    req.name = name;
+    req.resolution = resolution;
+    req.include_faces = False;
+    try:
+      resp = GetObjScan(req);
+    except rospy.ServiceException as err:
+      rospy.logerr(__name__ + ': get_obj_scan serivce falied: %s' % err);
+      return np.array([]);
+    pts = ru.to_array(resp.vertices);
+
+    if len(cachedObjScans) == objScanCacheSize:
+      # remove the oldest cached scan
+      cachedObjScans.popitem();
+    # add new cloud to the cache
+    cachedObjScans[k] = pts.copy();
+
+  if pose != None:
+    # transform points based on pose
+    pose = ru.to_Pose(pose);
+    T = tr.rospose2tr(pose);
+    pts = np.vstack((pts.T, np.ones(pts.shape[0])));
+    pts = np.dot(T, pts);
+    return pts[:3,:].T;
+  else:
+    return pts;
+
+
+def get_model(name, pose=None, resolution='lores'):
+  return get_pc_model(name, pose, resolution=resolution);
+
+
+def get_mass(name):
+  ''' returns the mass of the object in kg '''
+  req = object_model_srvs.GetMassRequest();
+  req.name = name; 
+  try:
+    resp = GetMass(req);
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': get_mass serivce falied: %s' % err);
+    return 0.0;
+
+  return resp.mass;
+
+graspPreshape = {};
+graspPreshape['right_angle_drill'] = np.array([0.0, 0.0, 0.0, 0.0]);
+graspPreshape['screwdriver'] = np.array([75.0, 75.0, 75.0, 0.0]) * np.pi / 180.0; # np.deg2rad(np.array([75.0, 75.0, 75.0, 0.0]));
+graspPreshape['hammer'] = np.array([75.0, 75.0, 75.0, 0.0]) * np.pi / 180.0; # np.deg2rad(np.array([75.0, 75.0, 75.0, 0.0]));
+graspPreshape['default'] = np.array([0.0, 0.0, 0.0, 0.0]);
+
+def get_grasp_preshape(name):
+  ''' returns the hand preshape of the object '''
+  if name not in graspPreshape.keys():
+    rospy.logwarn(__name__ + ': no known grasp preshape for %s. Using default.' % name);
+    return graspPreshape['default'];
+
+  return graspPreshape[name];
+
+graspVelocity = {};
+graspVelocity['right_angle_drill'] = np.array([1.0, 1.0, 1.0, 0.0]);
+graspVelocity['screwdriver'] = np.array([1.0, 1.0, 1.0, 0.0]);
+graspVelocity['default'] = np.array([1.0, 1.0, 1.0, 0.0]);
+
+def get_grasp_velocity(name):
+  ''' returns the grasp velocity for the object '''
+  if name not in graspVelocity.keys():
+    rospy.logwarn(__name__ + ': no known grasp velocity for %s. Using default.' % name);
+    return graspVelocity['default'];
+
+  return graspVelocity[name];
+
+def cleanup():
+  ''' this is designed to be called on preempts '''
+  pass;
+

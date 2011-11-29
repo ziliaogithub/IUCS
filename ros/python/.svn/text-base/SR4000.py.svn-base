@@ -1,0 +1,117 @@
+import time
+import math
+import copy 
+import numpy as np
+import scipy as sp 
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+
+import std_msgs.msg as std_msgs
+import geometry_msgs.msg as geometry_msgs
+import sensor_msgs.msg as sensor_msgs
+import message_filters
+
+import SR4000_msgs.msg as SR4000_msgs
+import SR4000_msgs.srv as SR4000_srvs
+
+import Perception_msgs_upenn.msg as Perception_msgs
+import Perception_msgs_upenn.srv as Perception_srvs
+
+import RosUtil as ru
+
+CONFIDENCE_TOPIC = '/SR4000/confidence_raw';
+AMPLITUDE_TOPIC = '/SR4000/amplitude_raw';
+DISTANCE_TOPIC = '/SR4000/distance_raw';
+POINTS_TOPIC  = '/SR4000/filtered/points';
+POINTS2_TOPIC = '/SR4000/filtered/points2';
+
+info = SR4000_msgs.CamInfo();
+
+def SR4000InfoCallback(data):
+  global info 
+  info = data;
+
+## setup ros subscribers
+rospy.logdebug(__name__ + ': setting up subscribers...');
+# re2
+rospy.Subscriber('/SR4000/cam_info', SR4000_msgs.CamInfo, SR4000InfoCallback, None, 1)
+
+## setup publishers
+rospy.logdebug(__name__ + ': setting up publishers...');
+shutterPub = rospy.Publisher('/SR4000/shutter', Perception_msgs.ShutterStamped);
+
+## setup services
+rospy.logdebug(__name__ + ': setting up service connections...')
+# re2 
+setAmplitudeThresholdService = ru.service_proxy('/SR4000/set_amplitude_threshold', SR4000_srvs.SetAmplitudeThreshold, not ru.is_sim());
+setExposureService = ru.service_proxy('/SR4000/set_auto_exposure', SR4000_srvs.SetAutoExposure, not ru.is_sim());
+setIntegrationTimeService = ru.service_proxy('/SR4000/set_integration_time', SR4000_srvs.SetIntegrationTime, not ru.is_sim());
+# upenn
+tabletopBlobDetector = ru.service_proxy('/SR4000/tabletop_blob_detector', Perception_srvs.TabletopBlobDetector, not ru.is_sim());
+
+
+def set_amplitude_threshold(threshold):
+  try:
+    resp = setAmplitudeThresholdService(threshold);
+    rospy.loginfo('SR4000: set amplitude threshold to %d' % (resp.threshold));
+  except rospy.ServiceException, e:
+    rospy.logerr('SR4000: SetAmplitudeThreshold service request failed:\t%s' % str(e));
+
+
+def set_exposure(minIntTime, maxIntTime, percentOverPos, desiredPos):
+  # Turns the AutoExposure on/off and set the desired parameters. 
+  # if minIntTime=0xff the AutoExposure is turned off.
+  # See SR4000 API documentation for more details.
+  try:
+    resp = setExposureService(minIntTime, maxIntTime, percentOverPos, desiredPos);
+    rospy.loginfo('SR4000: set exposure minIntTime=%d maxIntTime=%d percentOverPos=%d desiredPos=%d' % (resp.minIntTime, resp.maxIntTime, resp.percentOverPos, resp.desiredPos));
+  except rospy.ServiceException, e:
+    rospy.logerr('SR4000: SetExposure service request failed:\t%s' % str(e));
+
+
+def set_integration_time(integrationTime):
+  # Sets the integration time on the SR4000
+  # 0.300ms+(integrationTime)*0.100 ms
+  try:
+    resp = setIntegrationTimeService(integrationTime);
+    rospy.loginfo('SR4000: set integration time %d' % (resp.integrationTime));
+  except rospy.ServiceException, e:
+    rospy.logerr('SR4000: SetIntegrationTime service request failed:\t%s' % str(e));
+
+
+def shutter():
+  ''' shutters SR4000 image '''
+  t0 = rospy.Time().now();
+  shutterPub.publish(Perception_msgs.ShutterStamped(rospy.Header(0, t0, '/baseLink')));
+
+
+def get_raw_data():
+  ''' 
+    get the raw sr4k data
+    return (amplitude, confidence, distance)
+  '''
+  topics = [AMPLITUDE_TOPIC, CONFIDENCE_TOPIC, DISTANCE_TOPIC];
+  types = [sensor_msgs.Image, sensor_msgs.Image, sensor_msgs.Image]; 
+  return ru.wait_for_sync_message(topics, types);
+
+
+def get_points():
+  ''' return the filtered point cloud '''
+  return rospy.wait_for_message(POINTS_TOPIC, sensor_msgs.PointCloud);
+
+
+def get_points2():
+  ''' return the filtered point cloud 2 '''
+  return rospy.wait_for_message(POINTS2_TOPIC, sensor_msgs.PointCloud2);
+
+
+def tabletop_blob():
+  try:
+    resp = tabletopBlobDetector();
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': TabletopBlobDetector service request failed:\t%s' % str(e));
+    return Perception_srvs.TabletopBlobDetectorResponse().blobs_stamped;
+  
+  return resp.blobs_stamped;
+

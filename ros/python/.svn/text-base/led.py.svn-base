@@ -1,0 +1,44 @@
+import os
+import io
+import sys 
+import time 
+import copy 
+import math 
+import string 
+import numpy as np 
+import scipy as sp
+
+import roslib; roslib.load_manifest('scripting_util');
+import rospy
+
+import std_msgs.msg as std_msgs
+import sensor_msgs.msg as sensor_msgs
+import geometry_msgs.msg as geometry_msgs
+
+import SafetyLight_msgs.msg as SafetyLight_msgs
+
+import RosUtil as ru
+import Transform as tr
+
+
+## setup publishers
+rospy.logdebug(__name__ + ': setting up ros publishers...');
+leftLedPub = rospy.Publisher('/SafetyLight/left/set_color', SafetyLight_msgs.SetColor);
+rightLedPub = rospy.Publisher('/SafetyLight/right/set_color', SafetyLight_msgs.SetColor);
+rospy.sleep(0.5);
+
+def set_left(color):
+  ''' sets the left led to the desired color '''
+  (r, g, b) = ru.color2rgb(color);
+  leftLedPub.publish(r=int(r), g=int(g), b=int(b));
+
+def set_right(color):
+  ''' sets the right led to the desired color '''
+  (r, g, b) = ru.color2rgb(color);
+  rightLedPub.publish(r=int(r), g=int(g), b=int(b));
+
+def cleanup():
+  ''' this is designed to be called for preempts '''
+  set_left('k');
+  set_right('k');
+

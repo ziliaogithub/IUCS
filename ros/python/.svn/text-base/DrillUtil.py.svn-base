@@ -1,0 +1,104 @@
+import os
+import sys
+import time
+import copy
+import math
+import numpy as np
+import scipy as sp
+import matplotlib.pyplot as plt 
+
+import roslib; roslib.load_manifest('scripting_util');
+import rospy
+import tf
+import PyKDL as kdl
+import cv
+
+import std_msgs.msg as std_msgs
+import sensor_msgs.msg as sensor_msgs
+import geometry_msgs.msg as geometry_msgs
+
+import RosUtil as ru
+import Transform as tr
+
+import Arm
+import ObjectModel as om
+
+liftPath = [] # from the drill grasp, up, and back to pseudo-wing
+placePath = [] # liftPath.reverse() used to place drill back down when done
+graspPath = [] # path from pseudo-wing to behind drill grasp
+returnPath = [] # graspPath.reverse() used to bring arm back to wing when done
+
+reddotPose = None # will hold a PoseStamped when valid (after FindBlock runs)
+origDrillPose= None # will hold a Pose(Stamped?) for drill before being picked up
+
+drillArmWingPose = None # PoseStamped pose of wrist when holding drill in the pseudo-wing
+
+red_dot_wrist_pose_visual = None
+red_dot_wrist_pose_arm = None
+
+def get_drillTbit():
+  drillTtip = np.dot(tr.trans(-0.182, -0.0822, -0.00), tr.ezyx(-np.pi/2.0, 0.0, np.pi/2.0));
+  tipTbit = tr.trans(0.09, 0.0, 0.0);
+  drillTbit = np.dot(drillTtip, tipTbit);
+  return drillTbit;
+  
+def get_palmTbit(graspedDrillPS):
+  drillTbit = get_drillTbit();
+  graspedDrillPS_wrtPalm = ru.transformPose(ru.PALM_FRAME, graspedDrillPS);
+  palmTdrill = tr.rospose2tr(graspedDrillPS_wrtPalm);
+  return np.dot(palmTdrill, drillTbit);
+
+def get_wristTbit(graspedDrillPS):
+  palmTbit = get_palmTbit(graspedDrillPS);
+  wristTpalm = ru.lookupTransform(ru.WRIST_FRAME, ru.PALM_FRAME);
+  return np.dot(wristTpalm, palmTbit);
+
+def get_baseTbit(graspedDrillPS):
+  palmTbit = get_palmTbit(graspedDrillPS);
+  Tpalm = tr.rospose2tr(Arm.get_fk(frame=ru.PALM_FRAME));
+  return np.dot(Tpalm, palmTbit);
+
+  
+# for debugging 
+
+redDotPosePub = rospy.Publisher('/drill_util/red_dot', geometry_msgs.PoseStamped, latch=True);
+bitPrePosesPub = rospy.Publisher('/drill_util/bit_pre_poses', geometry_msgs.PoseArray, latch=True);
+wristPrePosesPub = rospy.Publisher('/drill_util/wrist_pre_poses', geometry_msgs.PoseArray, latch=True);
+drillbitPosePub = rospy.Publisher('/drill_util/drill_bit_pose', geometry_msgs.PoseStamped, latch=True);
+
+def publish_pre_servo_bit_poses(bitPSs):
+  ''' published the drill bit poses '''
+  pa = geometry_msgs.PoseArray();
+  pa.header.frame_id = ru.BASE_FRAME;
+  pa.poses = [ps.pose for ps in bitPSs];
+  bitPrePosesPub.publish(pa);
+
+def publish_pre_servo_wrist_poses(wristPSs):
+  ''' published the wrist bit poses '''
+  pa = geometry_msgs.PoseArray();
+  pa.header.frame_id = ru.BASE_FRAME;
+  pa.poses = [ps.pose for ps in wristPSs];
+  wristPrePosesPub.publish(pa);
+
+def publish_red_dot_pose(redDotPS):
+  ''' published the drill bit poses '''
+  redDotPosePub.publish(redDotPS);
+
+def publish_drill_bit_pose():
+  ''' published the drill bit poses '''
+  drillbitPosePub.publish(wristToDrillTip);
+
+def reset():
+  global liftPath, placePath, graspPath, returnPath, reddotPose, origDrillPose, drillArmWingPose, red_dot_wrist_pose_visual, red_dot_wrist_pose_arm
+  liftPath = [] # from the drill grasp, up, and back to pseudo-wing
+  placePath = [] # liftPath.reverse() used to place drill back down when done
+  graspPath = [] # path from pseudo-wing to behind drill grasp
+  returnPath = [] # graspPath.reverse() used to bring arm back to wing when done
+  
+  reddotPose = None # will hold a PoseStamped when valid (after FindBlock runs)
+  origDrillPose= None # will hold a Pose(Stamped?) for drill before being picked up
+  
+  drillArmWingPose = None # PoseStamped pose of wrist when holding drill in the pseudo-wing
+
+  red_dot_wrist_pose_visual = None
+  red_dot_wrist_pose_arm = None

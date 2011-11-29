@@ -1,0 +1,85 @@
+import time
+import math
+import copy 
+import numpy as np
+import scipy as sp 
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+import message_filters
+
+import std_msgs.msg as std_msgs
+import geometry_msgs.msg as geometry_msgs
+import sensor_msgs.msg as sensor_msgs
+
+import Bumblebee2_msgs.msg as Bumblebee2_msgs
+import Bumblebee2_msgs.srv as Bumblebee2_srvs
+
+import Perception_msgs_upenn.msg as Perception_msgs
+import Perception_msgs_upenn.srv as Perception_srvs
+
+import RosUtil as ru
+import threading
+
+IR_INFO_TOPIC           = '/kinect/ir/camera_info';
+IR_RAW_TOPIC            = '/kinect/ir/image_raw';
+IR_RECT_TOPIC           = '/kinect/ir/image_rect';
+RGB_INFO_TOPIC          = '/kinect/rgb/camera_info';
+RGB_RAW_TOPIC           = '/kinect/rgb/image_raw'
+RGB_RECT_TOPIC          = '/kinect/rgb/image_rect_color';
+POINTS_TOPIC            = '/kinect/rgb/points';
+POINTS2_TOPIC           = '/kinect/rgb/points2';
+POINTS_FILTERED_TOPIC   = '/kinect/rgb/points';
+POINTS2_FILTERED_TOPIC  = '/kinect/rgb/points2';
+
+
+## setup publishers
+rospy.logdebug(__name__ + ': setting up publishers...');
+# upenn
+shutterPub = rospy.Publisher('/kinect/shutter', Perception_msgs.ShutterStamped);
+
+
+def shutter():
+  ''' shutters Kinect images '''
+  t0 = rospy.Time().now();
+  shutterPub.publish(Perception_msgs.ShutterStamped(rospy.Header(0, t0, '/baseLink')));
+
+
+def get_points(filtered=True):
+  ''' returns the filtered disparity point cloud '''
+  topic = POINTS_FILTERED_TOPIC if filtered else POINTS_TOPIC 
+  return rospy.wait_for_message(topic, sensor_msgs.PointCloud);
+
+
+def get_points2(filtered=True):
+  ''' returns the filtered disparity point cloud 2 '''
+  topic = POINTS2_FILTERED_TOPIC if filtered else POINTS2_TOPIC 
+  return rospy.wait_for_message(topic, sensor_msgs.PointCloud2);
+
+
+def get_rgb(raw=False):
+  ''' returns the rgb color image '''
+  if raw:
+    return rospy.wait_for_message(RGB_RAW_TOPIC, sensor_msgs.Image);
+  else:
+    return rospy.wait_for_message(RGB_RECT_TOPIC, sensor_msgs.Image);
+
+
+def get_ir(raw=False):
+  ''' returns the ir color image '''
+  if raw:
+    return rospy.wait_for_message(IR_RAW_TOPIC, sensor_msgs.Image);
+  else:
+    return rospy.wait_for_message(IR_RECT_TOPIC, sensor_msgs.Image);
+
+
+def get_rgb_info():
+  ''' returns the rgb image info '''
+  return rospy.wait_for_message(RGB_INFO_TOPIC, sensor_msgs.CameraInfo);
+
+
+def get_ir_info():
+  ''' returns the right image info '''
+  return rospy.wait_for_message(IR_INFO_TOPIC, sensor_msgs.CameraInfo);
+
+

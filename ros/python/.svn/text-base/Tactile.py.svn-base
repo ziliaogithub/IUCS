@@ -1,0 +1,70 @@
+# Python wrappers for the tactile array
+# Depends on the bhand_pressure_server node in the BHand_pressure package
+
+import sys
+import time
+import math
+import copy 
+import numpy as np
+import scipy as sp 
+import threading
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+#import tf
+#import PyKDL as kdl
+
+#import std_msgs.msg as std_msgs
+#import geometry_msgs.msg as geometry_msgs
+#import visualization_msgs.msg as visualization_msgs
+
+#import pr_msgs.msg as pr_msgs
+#import pr_msgs.srv as pr_srvs
+
+import std_srvs.srv as std_srvs
+import BHand_pressure.msg as BHand_msgs
+import BHand_pressure.srv as BHand_srvs
+
+import RosUtil as ru
+
+state = BHand_msgs.ContactState()
+
+def StateCallback(data):
+  global state
+  state = copy.deepcopy(data)
+
+## setup ros subscribers
+rospy.logdebug(__name__ + ': setting up subscribers...');
+
+rospy.Subscriber('/RightArm/BHand/pressure_state', BHand_msgs.ContactState, StateCallback, None, 1)
+
+## setup ros services
+rospy.logdebug(__name__ + ': Setting up service connections...')
+# owd 
+CalibrateTactile = ru.service_proxy('/RightArm/BHand/calibrate', std_srvs.Empty, not ru.is_sim());
+
+def calibrate():
+  ''' calibrate the tactile sensors '''
+  rospy.loginfo(__name__ + ': calibrating tactile array');
+  try:
+    CalibrateTactile();
+  except:
+    rospy.logerr(__name__ + ': calibrate tactile array service request failed');
+    return False;
+  return True;
+
+def get_contact_state():
+  return state
+
+def get_contacts():
+  return state.contact_mask
+
+def get_contact_force():
+  return state.contact_force
+
+def is_pressed():
+  return np.array(state.contact_mask).any()
+
+def cleanup():
+  ''' this is designed to be called for preempts '''
+

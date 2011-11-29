@@ -1,0 +1,142 @@
+import time
+import math
+import copy 
+import string
+import numpy as np
+import scipy as sp 
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+import tf
+import PyKDL as kdl
+
+import std_msgs.msg as std_msgs
+import std_srvs.srv as std_srvs
+import geometry_msgs.msg as geometry_msgs
+import sensor_msgs.msg as sensor_msgs
+
+import roar_msgs.msg as roar_msgs
+
+import RosUtil as ru
+from polling_action_client import PollingActionClient as PAC
+
+
+# actual audio detector names
+detectorNames = [ 'right_angle_drill',
+                  'stapler',
+                  'flashlight_click',
+                  'pelican_case_drag'];
+detectorClients = dict.fromkeys(detectorNames);
+backgroundSubtractionServices = dict.fromkeys(detectorNames);
+
+# mapping between obj/event to 
+detectorMap = {(  'right_angle_drill',  'trigger') : 'right_angle_drill',
+               (            'stapler',   'staple') :           'stapler',
+               (         'flashlight',  'trigger') :  'flashlight_click',
+               (            'pelican',     'drag') : 'pelican_case_drag'};
+
+
+## setup ros subscribers
+rospy.logdebug(__name__ + ': setting up subscribers...');
+
+## setup publishers
+rospy.logdebug(__name__ + ': setting up publishers...');
+
+## setup services
+rospy.logdebug(__name__ + ': setting up services...');
+for key in backgroundSubtractionServices.keys():
+  backgroundSubtractionServices[key] = ru.service_proxy(('/roar/%s/background_subtract' % key), std_srvs.Empty, not ru.is_sim());
+
+## setup actionlib servers
+rospy.logdebug(__name__ + ': setting up actionlib connections...')
+for key in detectorClients.keys():
+  detectorClients[key] = PAC.PollingActionClient(('/roar/%s/detector' % key), roar_msgs.ROARDetectorAction, wait_for_server=False, feedback_queue_size=1);
+
+
+def subtract_background(objName=None, event=None):
+  '''
+    calls the server to subtract the background noise
+
+    if no argument is given then it does it for all detectors
+  '''
+  if (objName == None or event == None):
+    detectors = backgroundSubtractionServices.keys();
+  else:
+    if ((objName, event) in detectorMap.keys()):
+      detectors = [detectorMap[(objName, event)]];
+    else:
+      rospy.logerr(__name__ + ': background_subtract service request failed');
+      return False;
+    
+  success = True;
+  for detector in detectors:
+    try:
+      rospy.loginfo(__name__ + ': subtracting background from %s audio detector' % (detector));
+      backgroundSubtractionServices[detector]();
+    except rospy.ServiceException, ex:
+      rospy.logerr(__name__ + ': background_subtract service request failed: event = %s: %s' % (detector, ex));
+      success = False;
+  
+  return success;
+
+
+def listen_for(objName, event, stopOnDetection=False):
+  '''
+    starts the audio perception action server to listen for the given event
+  '''
+  if ((objName, event) in detectorMap.keys()):
+    rospy.loginfo(__name__ + ': listening for %s %s' % (objName, event));
+    detector = detectorMap[(objName, event)];
+    req = roar_msgs.ROARDetectorGoal(stopOnDetection);
+    detectorClients[detector].request(req);
+  else:
+    rospy.logwarn(__name__ + ': unkown audio detector for: %s, %s' % (objName, event));
+    return False;
+
+
+def detected(objName, event):
+  '''
+    returns the timestamp (in seconds) and confidence of the last detection 
+    if it was not detected then 0 is returned
+
+    assumes the dector has already been started
+  '''
+  if ((objName, event) in detectorMap.keys()):
+    detector = detectorMap[(objName, event)];
+    fb = detectorClients[detector].feedback();
+    if fb:
+      return (fb.stamp.to_sec(), fb.svm_distance);
+    else:
+      return (rospy.Time(0).to_sec(), 0);
+  else:
+    rospy.logwarn(__name__ + ': unkown audio detector for: %s' % objName);
+    return (rospy.Time(0).to_sec(), 0);
+
+
+def stop(objName, event):
+  '''
+    stops the detector
+  '''
+  if ((objName, event) in detectorMap.keys()):
+    detector = detectorMap[(objName, event)];
+    detectorClients[detector].cancel();
+    return True;
+  else:
+    rospy.logwarn(__name__ + ': unkown audio detector for: %s, %s' % (objName, event));
+    return False;
+
+
+def stop_all():
+  '''
+    stops all running detectors
+  '''
+  for event in detectorClients.keys():
+    detectorClients[event].cancel();
+
+  return True;
+
+
+def cleanup():
+  ''' this is designed to be called on preempts '''
+  stop_all();
+

@@ -1,0 +1,742 @@
+import os
+import sys 
+import time 
+import copy 
+import math 
+import string
+import numpy as np 
+import scipy as sp
+
+import roslib; roslib.load_manifest('scripting_util');
+import rospy
+
+import std_msgs.msg as std_msgs
+import std_srvs.srv as std_srvs
+import sensor_msgs.msg as sensor_msgs
+import geometry_msgs.msg as geometry_msgs
+
+import task_msgs.msg as task_msgs
+import Perception_msgs_upenn.msg as Perception_msgs
+import Perception_msgs_upenn.srv as Perception_srvs
+import LookFind_msgs.msg as LookFind_msgs
+import visualization_msgs.msg as visualization_msgs 
+
+import RosUtil as ru
+import Transform as tr
+import led
+import ObjectModel as om
+import PointCloudUtil as pcu
+
+from polling_action_client import PollingActionClient as PAC
+
+
+DISPLAY_NS = 'perception_display';
+# keep list of known objects so multiple instances of Perception work better togther
+DISPLAY_IDS = { 'table'             : 0,
+                'paper'             : 1,
+                'ball'              : 2,
+                'canteen'           : 3,
+                'flashlight'        : 4,
+                'floodlight'        : 5,
+                'hammer'            : 6,
+                'maglite'           : 7,
+                'pelican'           : 8,
+                'phone_cradle'      : 9,
+                'phone_handset'     : 10,
+                'pvc_pipe_big'      : 11,
+                'pvc_pipe_small'    : 12,
+                'radio'             : 13,
+                'right_angle_drill' : 14,
+                'rock'              : 15,
+                'screwdriver'       : 16,
+                'shovel'            : 17,
+                'stapler'           : 18,
+                'waterbottle'       : 19,
+                'woodblock'         : 20,
+                'door'              : 21,
+                'door_handle'       : 22,
+                'red_dot'           : 23}
+
+
+## subscribers 
+rospy.logdebug(__name__ + ': setting up subscribers...')
+
+## publishers
+rospy.logdebug(__name__ + ': setting up publishers...')
+graspPosesPub = rospy.Publisher('/target_object/grasp_poses', geometry_msgs.PoseArray, latch=False)
+perceptionMarkersPub = rospy.Publisher('/perception_markers_array', visualization_msgs.MarkerArray);
+
+## setup services
+rospy.logdebug(__name__ + ': setting up service connections...')
+# upenn 
+calibrateTable = ru.service_proxy('table_finder_action', Perception_srvs.TableFinderCmd, not ru.is_sim());
+orientPhone = ru.service_proxy('/phone_orientation', Perception_srvs.OrientPhoneCmd, not ru.is_sim());
+templateMatcherInit = ru.service_proxy('/tm_init_template', Perception_srvs.InitTemplateCmd, not ru.is_sim());
+templateMatcherDetect = ru.service_proxy('/tm_detect_template', Perception_srvs.DetectTemplateCmd, not ru.is_sim());
+templateMatcherRelease = ru.service_proxy('/tm_release_template', Perception_srvs.ReleaseTemplateCmd, not ru.is_sim());
+templateMatcherReload = ru.service_proxy('/tm_reload_database', std_srvs.Empty, not ru.is_sim());
+doorDetector = ru.service_proxy('/door_detector/detect_door', Perception_srvs.DetectDoor, not ru.is_sim());
+
+## actionlib connections
+rospy.logdebug(__name__ + ': setting up actionlib connections...')
+# track server
+#lookFindClient = ru.actionlib_proxy('look_find_action_server', LookFind_msgs.LookFindAction, not ru.is_sim());
+lookFindClient = PAC.PollingActionClient('look_find_action_server', LookFind_msgs.LookFindAction, wait_for_server=False);
+tableProbeClient = ru.actionlib_proxy('probe_table_server', task_msgs.TaskSpecificationAction, not ru.is_sim());
+
+
+def publish_grasp_poses(grasps):
+  ''' publishes pose array of the grasp poses '''
+  pa = geometry_msgs.PoseArray();
+  pa.header = ru.header(stamp=rospy.Time.now());
+  pa.poses = map(lambda grasp: grasp.wristPose.pose, grasps);
+  graspPosesPub.publish(pa); 
+
+def clear_grasp_poses():
+  ''' clears the grasp pose array '''
+  pa = geometry_msgs.PoseArray();
+  pa.header = ru.header(stamp=rospy.Time.now());
+  graspPosesPub.publish(pa); 
+
+
+def get_object_marker_id(name):
+  '''
+    returns the marker id for the object
+  '''
+  if name not in DISPLAY_IDS.keys():
+    # add to display
+    maxid = np.max(DISPLAY_IDS.values());
+    DISPLAY_IDS[name] = maxid + 1;
+
+  return DISPLAY_IDS[name];
+
+
+def create_delete_marker(name):
+  '''
+    creates a marker message for deleting the marker
+  '''
+  marker = visualization_msgs.Marker();
+  marker.ns = DISPLAY_NS;
+  marker.id = get_object_marker_id(name);
+  marker.header = ru.header(stamp=rospy.Time().now(), frame_id=ru.BASE_FRAME);
+  marker.action = marker.DELETE;  
+  marker.text = name;
+
+  # special case for paper
+  if (name == 'paper'):
+    marker.type = marker.CUBE;
+  elif (name == 'red_dot'):
+    marker.type = marker.CYLINDER;
+  elif (name == 'table'):
+    marker.type = marker.CUBE;
+  else: 
+    marker.type = marker.POINTS;
+
+  return marker;
+  
+
+def create_marker(obj, usePointCloud=True):
+  '''
+    creates a visualization marker from the Object message
+  '''
+  marker = visualization_msgs.Marker();
+  marker.ns = DISPLAY_NS;
+  marker.id = get_object_marker_id(obj.name);
+  marker.header = ru.header(stamp=rospy.Time().now(), frame_id=ru.BASE_FRAME);
+  marker.action = marker.ADD;  
+  marker.pose = copy.deepcopy(obj.pose.pose);
+  marker.lifetime = rospy.Time();
+  marker.frame_locked = True;
+  marker.text = obj.name;
+  rospy.loginfo('creating marker for object %s, success = %s' % (obj.name, obj.success));
+
+  # special case for paper
+  if (obj.name == 'paper'):
+    # display paper as an orange cube
+    marker.type = marker.CUBE;
+    marker.scale = ru.to_Vector3([(0.0254*11.0), (0.0254*8.5), 0.005]);
+    marker.color = std_msgs.ColorRGBA(r=1.0, g=0.5, b=0.0, a=1.0);
+    marker.pose.position.z = table_pose().pose.position.z + 0.002;
+
+  elif (obj.name == 'red_dot'):
+    # display paper as an red cylinder
+    marker.type = marker.CYLINDER;
+    marker.scale = ru.to_Vector3([0.05, 0.05, 0.01]);
+    marker.color = std_msgs.ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0);
+    # z is the cylinder axis
+    (ex, ey, ez) = tr.rosq2ev(marker.pose.orientation);
+    ez = ex;
+    ex = np.cross(ey, ez);
+    marker.pose.orientation = tr.ev2rosq((ex, ey, ez));
+
+  elif usePointCloud: 
+    # display point cloud model
+    marker.type = marker.POINTS;
+    marker.scale = ru.to_Vector3([0.005, 0.005, 0.005]);
+    marker.color = std_msgs.ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0);
+    if (obj.use_sensor_data_for_collisions):
+      # transform pts to orig pose frame
+      Tpose0 = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, obj.orig_refined_pose));
+
+      # get pts wrt original pose
+      pts_wrtBase = ru.to_array(obj.blob.points);
+      pts_wrtBase = np.vstack((pts_wrtBase.T, np.ones(pts_wrtBase.shape[0]))); 
+      pts_wrtPose0 = np.dot(np.linalg.inv(Tpose0), pts_wrtBase);
+
+      pc = ru.to_PointCloud(pcu.downsample(pts_wrtPose0.T[:,:3], [0.01, 0.01, 0.01]));
+    else:
+      pc = ru.to_PointCloud(om.get_pc_model(obj.name));
+    marker.points = pc.points;
+
+  else:
+    # get the obj file
+    marker.type = marker.MESH_RESOURCE;
+    marker.scale = ru.to_Vector3([0.001, 0.001, 0.001]);
+    marker.color = std_msgs.ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0);
+    marker.mesh_resource = om.get_obj_file_location(obj.name);
+
+  return marker;
+
+
+def create_grasped_marker(graspPose, obj):
+  '''
+    creates the marker message a the grasped object
+  '''
+  marker = visualization_msgs.Marker();
+  marker.ns = DISPLAY_NS;
+  marker.id = get_object_marker_id(obj.name);
+  marker.header = ru.header(stamp=rospy.Time().now(), frame_id=graspPose.header.frame_id);
+  marker.action = marker.ADD;
+  marker.pose = graspPose.pose
+  marker.lifetime = rospy.Time();
+  marker.frame_locked = True;
+  marker.text = obj.name;
+  rospy.loginfo('creating marker for grasped object %s, success = %s' % (obj.name, obj.success));
+
+  # display point cloud model
+  marker.type = marker.POINTS;
+  marker.scale = ru.to_Vector3([0.005, 0.005, 0.005]);
+  marker.color = std_msgs.ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0);
+  if (obj.use_sensor_data_for_collisions):
+    # transform pts to pose frame
+    Tpose0 = tr.rospose2tr(ru.transformPose(ru.BASE_FRAME, obj.orig_refined_pose));
+
+    # get pts wrt original pose
+    pts_wrtBase = ru.to_array(obj.blob.points);
+    pts_wrtBase = np.vstack((pts_wrtBase.T, np.ones(pts_wrtBase.shape[0]))); 
+    pts_wrtPose0 = np.dot(np.linalg.inv(Tpose0), pts_wrtBase);
+
+    pc = ru.to_PointCloud(pcu.downsample(pts_wrtPose0.T[:,:3], [0.01, 0.01, 0.01]));
+  else:
+    pc = ru.to_PointCloud(om.get_pc_model(obj.name));
+  marker.points = pc.points;
+
+  return marker;
+
+
+def create_table_marker(height):
+  '''
+    creates the marker message for the table
+  '''
+  marker = visualization_msgs.Marker();
+  marker.ns = DISPLAY_NS;
+  marker.id = get_object_marker_id('table');
+  marker.header = ru.header(stamp=rospy.Time().now(), frame_id=ru.BASE_FRAME);
+  marker.action = marker.ADD;  
+  marker.pose = table_pose().pose;
+  marker.lifetime = rospy.Time();
+  marker.frame_locked = True;
+
+  # display point cloud model
+  marker.type = marker.CUBE;
+  marker.scale = ru.to_Vector3([table_width(), table_depth(), 0.001]);
+  marker.color = std_msgs.ColorRGBA(r=0.3, g=0.15, b=0.0, a=1.0);
+
+  return marker;
+
+
+def display_objects(objects):
+  ''' publish a marker array containing the object detections '''
+  msg = visualization_msgs.MarkerArray(); 
+  for obj in objects:
+    msg.markers.append(create_marker(obj));
+
+  # publish markers  
+  perceptionMarkersPub.publish(msg);
+
+
+def display_grasped_objects(graspedObjects):
+  ''' graspedObjects is a list of (pose, obj) tuples of grasped objects '''
+  msg = visualization_msgs.MarkerArray(); 
+  for (graspPose, obj) in graspedObjects:
+    msg.markers.append(create_grasped_marker(graspPose, obj));
+
+  # publish markers  
+  perceptionMarkersPub.publish(msg);
+
+
+def display_table():
+  ''' publish a marker array containing the table marker'''
+  msg = visualization_msgs.MarkerArray(); 
+  
+  msg.markers.append(create_table_marker(table_height()));
+
+  # publish markers  
+  perceptionMarkersPub.publish(msg);
+
+
+def update_perception_display(graspedObjects, objects):
+  '''   
+    updated the perception display
+      graspedObjects is a list of (pose, obj) tuples of grasped objects
+      objects is a list of obj messages
+  '''
+  # publish objects
+  display_objects(objects);
+
+  # publish grasped objects
+  if graspedObjects != None:
+    display_grasped_objects(graspedObjects);
+
+  # publish table
+  display_table();
+
+
+def clear_displays():
+  ''' clears all marker displays '''
+  msg = visualization_msgs.MarkerArray();
+  msg.markers = map(lambda name: create_delete_marker(name), DISPLAY_IDS.keys());
+    
+  # publish markers  
+  perceptionMarkersPub.publish(msg);
+  
+  # clear all other displays
+  clear_object_displays()
+  clear_grasp_poses()
+
+
+def clear_object_displays():
+  ''' clears all marker displays (except the table)'''
+  msg = visualization_msgs.MarkerArray();
+  names = DISPLAY_IDS.keys();
+  names.remove('table');
+  msg.markers = map(lambda name: create_delete_marker(name), names);
+    
+  # publish markers  
+  perceptionMarkersPub.publish(msg);
+
+
+def table_height():
+  ''' returns the best estimate of the table height '''
+  return rospy.get_param('/probe_table_height', 0.0) + 0.00;
+
+
+def table_width():
+  ''' returns the table width '''
+  return rospy.get_param('/table_width', 1.83) + 0.00;
+
+
+def table_depth():
+  ''' returns the table depth '''
+  return rospy.get_param('/table_depth', 0.92) + 0.00;
+
+
+def table_pose():
+  ''' 
+    returns the table pose as a pose stamped message
+    pose is centered in the table center
+  '''
+  closeLeftX = rospy.get_param("/table_close_left_corner_X", 0.66)
+  farRightX = rospy.get_param("/table_far_right_corner_X", 1.99)
+  closeLeftY = rospy.get_param("/table_close_left_corner_Y", 0.72)
+  farRightY = rospy.get_param("/table_far_right_corner_Y", -1.19)
+  tableWidth = table_width();
+  tableDepth = table_depth();
+
+  # compute close right and far left corners (assuming width is left->right)
+  thTable = np.arctan2(tableDepth, tableWidth);
+  thDiag = np.arctan2(farRightY - closeLeftY, farRightX - closeLeftX);
+  th = thDiag - thTable;
+
+  centX = (farRightX + closeLeftX)/2.0;
+  centY = (farRightY + closeLeftY)/2.0;
+
+  R = tr.rotz(th);
+  t = tr.trans([centX, centY, table_height()]);
+
+  return ru.to_PoseStamped(np.dot(t, R));
+
+def isOnTable(point, edge_buffer=0.1):
+  ''' 
+  looks at the x and y coords of point and returns true if inside table boundary.
+  
+  edge_buffer decreases the size of the table by this amount on each edge
+  '''
+  
+  point = ru.to_Point(point)
+  
+  # # baseLink
+  # maxX = rospy.get_param("/table_close_left_corner_X", 0.87)
+  # minX = rospy.get_param("/table_far_right_corner_X", -0.93)
+  # maxY = rospy.get_param("/table_close_left_corner_Y", -0.66)
+  # minY = rospy.get_param("/table_far_right_corner_Y", -1.62)
+
+  # base_link
+  closeLeftX = rospy.get_param("/table_close_left_corner_X", 0.66)
+  farRightX = rospy.get_param("/table_far_right_corner_X", 1.99)
+  closeLeftY = rospy.get_param("/table_close_left_corner_Y", 0.72)
+  farRightY = rospy.get_param("/table_far_right_corner_Y", -1.19)
+  tableWidth = rospy.get_param("/table_width", 1.83);
+  tableDepth = rospy.get_param("/table_depth", 0.92);
+
+  # compute close right and far left corners (assuming width is left->right)
+  thTable = np.arctan2(tableDepth, tableWidth);
+  thDiag = np.arctan2(farRightY - closeLeftY, farRightX - closeLeftX);
+  th = thDiag - thTable;
+
+  closeRightX = closeLeftX + tableWidth * np.cos(th);
+  closeRightY = closeLeftY + tableWidth * np.sin(th);
+  farLeftX = closeLeftX - tableDepth * np.sin(th);
+  farLeftY = closeLeftY + tableDepth * np.cos(th);
+
+  minX = min(closeLeftX, closeRightX, farRightX, farLeftX);
+  maxX = max(closeLeftX, closeRightX, farRightX, farLeftX);
+  minY = min(closeLeftY, closeRightY, farRightY, farLeftY);
+  maxY = max(closeLeftY, closeRightY, farRightY, farLeftY);
+
+  if point.x > maxX - edge_buffer:
+    return False
+  if point.x < minX + edge_buffer:
+    return False
+  if point.y > maxY - edge_buffer:
+    return False
+  if point.y < minY + edge_buffer:
+    return False
+  return True        
+
+def scan(targets=[], scan='quick', skipTemplateMatch=False, angles=[], timeout=None, preempt_requested_fcn=None, block=True):
+  '''
+    targets is a list of object names to scan for.
+    scan: 'quick', 'full', 'none', or 'angles'
+    angles: list of tuples: (lowerPan, lowerTilt, upperPan, upperTilt). only used if scan='angles'.
+    
+    return (status, result)
+    
+    status:
+     0 = client returned success
+     1 = client returned fail (result may or may not be None)
+    -1 = preempt requested (or action server stopped) (result None)
+    -2 = timeout  (result None)
+    -3 = ros shutdown (result None)
+    -4 = unknown error (result None)
+    
+    if block is False, then (0, None) will be returned
+  '''
+  global lookFindClient
+
+  # construct goal
+  goal = LookFind_msgs.LookFindGoal();
+  goal.skipTemplateMatch = skipTemplateMatch
+  goal.targets = targets;
+  if scan.lower() == 'quick':
+    goal.scan_type = goal.QUICK
+  elif scan.lower() == 'full':
+    goal.scan_type = goal.FULL
+  elif scan.lower() == 'high':
+    goal.scan_type = goal.HIGH
+  elif scan.lower() == 'current' or scan.lower() == 'none':
+    goal.scan_type = goal.CURRENT
+  elif scan.lower() == 'angles':
+    goal.scan_type = goal.ANGLES
+    for (lp, lt, up, ut) in angles:
+      goal.lower_pan.append(lp);
+      goal.lower_tilt.append(lt);
+      goal.upper_pan.append(up);
+      goal.upper_tilt.append(ut);
+      
+  try:
+    lookFindClient.request(goal);
+    
+    if not block:
+      return (0, None)
+    
+    (success, result) = lookFindClient.wait_for_result(max_seconds = timeout,
+                                                        stop_condition_lambda = preempt_requested_fcn)
+
+    if not success:
+      rospy.logwarn(__name__ + ': LookFind action not successful');
+      return (1, result)
+    
+    return (0, result)
+
+  except PAC.Stopped as e:
+    return (-1, None)
+  except PAC.ActionlibTimeout as e:
+    return (-2, None)
+  except PAC.Shutdown as e:
+    return (-3, None)
+  except Exception as e:
+    rospy.logerr(__name__ + ': LookFind action exception: %s' % str(e));
+    return (-4, None)
+    
+  
+# def scan(action, targets=[], scan='quick', skipTemplateMatch=False, angles=[]):
+#   '''
+#     angles: list of tuples: (lowerPan, lowerTilt, upperPan, upperTilt)
+#   '''
+#   global lookFindClient  
+#   action = string.lower(action);
+
+#   if action == 'start':
+#     goal = LookFind_msgs.LookFindGoal();
+    
+#     if scan.lower() == 'quick':
+#       goal.scan_type = goal.QUICK
+#     elif scan.lower() == 'full':
+#       goal.scan_type = goal.FULL
+#     elif scan.lower() == 'current' or scan.lower() == 'none':
+#       goal.scan_type = goal.CURRENT
+#     elif scan.lower() == 'angles':
+#       goal.scan_type = goal.ANGLES
+#       for (lp, lt, up, ut) in angles:
+#         goal.lower_pan.append(lp);
+#         goal.lower_tilt.append(lt);
+#         goal.upper_pan.append(up);
+#         goal.upper_tilt.append(ut);
+#     goal.skipTemplateMatch = skipTemplateMatch
+#     goal.targets = targets;
+#     rospy.logdebug(__name__ + ': sending LookFind goal:\n%s' % goal);
+#     lookFindClient.send_goal(goal);
+#   elif action == 'status':
+#     return lookFindClient.get_state();
+#   elif action == 'result':
+#     return lookFindClient.get_result(); 
+#   elif action == 'preempt':
+#     lookFindClient.cancel_all_goals(); 
+#   elif action == 'wait':
+#     # wait for result
+#     pass;
+#   else:
+#     rospy.logwarn(__name__ + ': scan: unkown action %s' % action);
+
+
+def obj_msg_from_blob(name, blob):
+  ''' creates a Perception_msgs/Object message from the BlobStamped message '''
+  o = Perception_msgs.Object();
+  o.name = name;
+  o.border = blob.border;
+  o.blob = copy.deepcopy(blob);
+  o.success = True;
+  t = tr.trans(ru.to_array(blob.centroid));
+  R = tr.ev2rot(ru.to_array(blob.eigenvectors[0]), ru.to_array(blob.eigenvectors[1]), ru.to_array(blob.eigenvectors[2]));
+  o.pose = ru.to_PoseStamped(np.dot(t, R));
+  o.pose.header = copy.copy(blob.header);
+
+  return o;
+
+
+def bb2_table_calibrate():
+  global calibrateTable
+  ret = calibrateTable('find_table');
+  if 'table_found' == ret.str:
+    return True;
+  else:
+    rospy.logwarn(__name__ + ': BB2 Table calibration failed: %s' % ret.str);
+    return False;
+
+
+def table_probe(action):
+  global tableProbeClient  
+  action = string.lower(action);
+
+  if action == 'start':
+    goal = task_msgs.TaskSpecificationGoal();
+    rospy.logdebug(__name__ + ': sending table probe goal');
+    tableProbeClient.send_goal(goal);
+  elif action == 'status':
+    return tableProbeClient.get_state();
+  elif action == 'result':
+    return tableProbeClient.get_result(); 
+  elif action == 'preempt':
+    tableProbeClient.cancel_all_goals(); 
+  elif action == 'wait':
+    # wait for result
+    return tableProbeClient.wait_for_result(rospy.Duration(0));
+  else:
+    rospy.logwarn(__name__ + ': table_probe: unkown action %s' % action);
+
+
+def is_phone_upright(imgMsg):
+  ''' calls the phone orientation service '''
+  try:
+    resp = orientPhone(imgMsg);
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': phone_orientation: service request failed: %s' % e);
+    # just assume its upright
+    return True;
+
+  return resp.isupright;
+
+
+def template_init(name):
+  ''' calls the init template matcher service '''
+  try:
+    resp = templateMatcherInit(name);
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': template_init: service request failed: %s' % e);
+    return False;
+
+  return True;
+
+
+def template_detect(name, xaxis, yaxis, zaxis, blob_pose, doAlignment=False, useTable=True):
+  ''' 
+    calls the detect template matcher service 
+    if doAlignment then it does the object model alignment with either 
+      the table or the stereo cloud based on useTable
+  '''
+  led.set_right('r');
+  try:
+    resp = templateMatcherDetect(name, xaxis, yaxis, zaxis, 0, 0, 0, 0, blob_pose);
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': template_detect: service request failed: %s' % e);
+    led.set_right('k');
+    return None;
+
+  led.set_right('k');
+
+  
+  if resp.success:
+    if doAlignment:
+      npose = align_2d_detection(name, resp.object_pose, resp.cx, resp.cy, resp.cam_info, useTable=useTable);
+      return npose;
+    else:   
+      return ru.transformPose(ru.BASE_FRAME, resp.object_pose);
+  else:
+    rospy.logwarn(__name__ + ': template_detect: %s' % resp.failure_reason);
+    return None
+
+
+def template_release(name):
+  ''' calls the release template matcher service '''
+  try:
+    resp = templateMatcherRelease(name);
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': template_release: service request failed: %s' % e);
+    return False;
+
+  return True;
+
+def template_reload():
+  ''' calls the reload template matcher service '''
+  try:
+    resp = templateMatcherReload();
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': template_reload: service request failed: %s' % e);
+    return False;
+
+  return True;
+
+def align_2d_detection(name, ps, cx, cy, cam_info, useTable=True):
+  '''
+    finds the true object centroid from a image detection
+    uses either the table or the stereo cloud to align the model
+    
+    name - name of the object
+    ps - pose stamped message of the object in the camera frame
+    cx - x coord of detection centroid (in image)
+    cy - y coord of detection centroid (in image)
+    fx - focal length of the camera
+
+    NYI: for useTable==False 
+  '''
+  frame_id = ps.header.frame_id;
+  nps = ru.transformPose(ru.BASE_FRAME, ps);
+  R = tr.rospose2rot(nps);
+  
+  P = np.reshape(np.array(cam_info.P), (3,4))[:,:3];
+  det_wrtImage = np.array([cx, cy, 1.0]);
+  det_wrtFrame = np.dot(np.linalg.inv(P), det_wrtImage);
+  det_wrtFrame /= np.linalg.norm(det_wrtFrame);
+
+  if useTable:
+    # get detection ray in base frame
+    origin_wrtBase = ru.transformPoint(ru.BASE_FRAME, ru.to_PointStamped([0,0,0], frame_id=frame_id));
+    imDet_wrtBase = ru.transformPoint(ru.BASE_FRAME, ru.to_PointStamped(det_wrtFrame, frame_id=frame_id))
+
+    tableHeight = table_height();
+
+    # get transformed object model
+    model = om.get_model(name);
+    model = np.dot(R, np.vstack((model.T, np.ones(model.shape[0]))))[:3,:].T;
+
+    minz = np.min(model[:,2]);
+
+    # true centroid is the intersection of the ray from the camera with the plane 
+    # parrallel to the table plane at the height the object would be if touching the table
+    tableN = np.array([0.0, 0.0, 1.0]);
+    tableP = np.array([1.0, 0.0, tableHeight - minz]);
+    bblP0 = ru.to_array(origin_wrtBase);
+    bblP1 = ru.to_array(imDet_wrtBase);
+
+    # compute intersection
+    u = np.dot(tableN, tableP - bblP0)/np.dot(tableN, bblP1 - bblP0);
+    centroid = bblP0 + u * (bblP1 - bblP0);
+    nps.pose.position = ru.to_Point(centroid);
+
+    return nps;
+
+  else:
+    # use edge of the stereo cloud to align model
+    # TODO: finish implementing this
+
+    # get transformed object model
+    model = om.get_model(name);
+    model = np.dot(R, np.vstack((model.T, np.ones(model.shape[0]))));
+
+    th = ru.angle_between([0,0,1], det_wrtFrame);
+    axis = np.cross([0,0,1], det_wrtFrame);
+    R_detRay = tr.axis_angle2rot(axis, th);
+
+    # transform model pts into detection frame
+    model_wrtDetection = np.dot(np.linalg.inv(R_detRay), model);
+
+    # TODO: get stereo edge estimate
+  
+    # compute diff and move object along z to align 
+
+    # transform back into bbl and then base to get actual pose
+
+
+def detect_door(doorHandle=False, phoneCradle=False, source='bb2'): 
+  ''' 
+    wrapper for the door detector service 
+    return (success, door, [door_handle], [phone_cradle])
+      door_handle and phone_cradle will only be returned if they are requested
+  '''
+  try:
+    resp = doorDetector(source=source, find_door_handle=doorHandle, find_phone_cradle=phoneCradle);
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': detect_door: service request failed: %s' % e);
+    ret = [False, Perception_msgs.Object(name='door')];
+    if doorHandle: 
+      ret.append(Perception_msgs.Object(name='door_handle'));
+    if phoneCradle: 
+      ret.append(Perception_msgs.Object(name='phone_cradle'));
+    return tuple(ret);
+
+  ret = [resp.success, resp.door];
+  if doorHandle: 
+    ret.append(resp.door_handle);
+  if phoneCradle: 
+    ret.append(resp.phone_cradle);
+  return tuple(ret);
+
+
+
+def cleanup():
+  ''' this is designed to be called for preempts '''
+  #scan('preempt');
+  clear_grasp_poses();
+  clear_displays();
+  

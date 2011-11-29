@@ -1,0 +1,287 @@
+import time
+import math
+import copy 
+import pickle
+import numpy as np
+import scipy as sp 
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+import message_filters
+
+import std_msgs.msg as std_msgs
+import geometry_msgs.msg as geometry_msgs
+import sensor_msgs.msg as sensor_msgs
+import visualization_msgs.msg as visualization_msgs
+
+import task_msgs.msg as task_msgs
+
+import RosUtil as ru
+import Transform as tr
+import PointCloudUtil as pcu
+
+
+# PointCloud publishers
+pc0Pub = rospy.Publisher('/pc0', sensor_msgs.PointCloud, latch=True);
+pc1Pub = rospy.Publisher('/pc1', sensor_msgs.PointCloud, latch=True);
+pc2Pub = rospy.Publisher('/pc2', sensor_msgs.PointCloud, latch=True);
+pc3Pub = rospy.Publisher('/pc3', sensor_msgs.PointCloud, latch=True);
+pc4Pub = rospy.Publisher('/pc4', sensor_msgs.PointCloud, latch=True);
+pc5Pub = rospy.Publisher('/pc5', sensor_msgs.PointCloud, latch=True);
+pc6Pub = rospy.Publisher('/pc6', sensor_msgs.PointCloud, latch=True);
+pc7Pub = rospy.Publisher('/pc7', sensor_msgs.PointCloud, latch=True);
+pc8Pub = rospy.Publisher('/pc8', sensor_msgs.PointCloud, latch=True);
+pc9Pub = rospy.Publisher('/pc9', sensor_msgs.PointCloud, latch=True);
+pcPub = [pc0Pub,
+         pc1Pub,
+         pc2Pub,
+         pc3Pub,
+         pc4Pub,
+         pc5Pub,
+         pc6Pub,
+         pc7Pub,
+         pc8Pub,
+         pc9Pub]
+
+# PoseStamped publishers
+ps0Pub = rospy.Publisher('/ps0', geometry_msgs.PoseStamped, latch=True);
+ps1Pub = rospy.Publisher('/ps1', geometry_msgs.PoseStamped, latch=True);
+ps2Pub = rospy.Publisher('/ps2', geometry_msgs.PoseStamped, latch=True);
+ps3Pub = rospy.Publisher('/ps3', geometry_msgs.PoseStamped, latch=True);
+ps4Pub = rospy.Publisher('/ps4', geometry_msgs.PoseStamped, latch=True);
+ps5Pub = rospy.Publisher('/ps5', geometry_msgs.PoseStamped, latch=True);
+ps6Pub = rospy.Publisher('/ps6', geometry_msgs.PoseStamped, latch=True);
+ps7Pub = rospy.Publisher('/ps7', geometry_msgs.PoseStamped, latch=True);
+ps8Pub = rospy.Publisher('/ps8', geometry_msgs.PoseStamped, latch=True);
+ps9Pub = rospy.Publisher('/ps9', geometry_msgs.PoseStamped, latch=True);
+ps10Pub = rospy.Publisher('/ps10', geometry_msgs.PoseStamped, latch=True);
+ps11Pub = rospy.Publisher('/ps11', geometry_msgs.PoseStamped, latch=True);
+ps12Pub = rospy.Publisher('/ps12', geometry_msgs.PoseStamped, latch=True);
+ps13Pub = rospy.Publisher('/ps13', geometry_msgs.PoseStamped, latch=True);
+ps14Pub = rospy.Publisher('/ps14', geometry_msgs.PoseStamped, latch=True);
+ps15Pub = rospy.Publisher('/ps15', geometry_msgs.PoseStamped, latch=True);
+ps16Pub = rospy.Publisher('/ps16', geometry_msgs.PoseStamped, latch=True);
+ps17Pub = rospy.Publisher('/ps17', geometry_msgs.PoseStamped, latch=True);
+ps18Pub = rospy.Publisher('/ps18', geometry_msgs.PoseStamped, latch=True);
+ps19Pub = rospy.Publisher('/ps19', geometry_msgs.PoseStamped, latch=True);
+psPub = [ps0Pub,
+         ps1Pub,
+         ps2Pub,
+         ps3Pub,
+         ps4Pub,
+         ps5Pub,
+         ps6Pub,
+         ps7Pub,
+         ps8Pub,
+         ps9Pub,
+         ps10Pub,
+         ps12Pub,
+         ps13Pub,
+         ps14Pub,
+         ps15Pub,
+         ps16Pub,
+         ps17Pub,
+         ps18Pub,
+         ps19Pub]
+
+# PointCloud2 publishers
+pc0Pub2 = rospy.Publisher('/pc2_0', sensor_msgs.PointCloud2, latch=True);
+pc1Pub2 = rospy.Publisher('/pc2_1', sensor_msgs.PointCloud2, latch=True);
+pc2Pub2 = rospy.Publisher('/pc2_2', sensor_msgs.PointCloud2, latch=True);
+pc3Pub2 = rospy.Publisher('/pc2_3', sensor_msgs.PointCloud2, latch=True);
+pc4Pub2 = rospy.Publisher('/pc2_4', sensor_msgs.PointCloud2, latch=True);
+pc5Pub2 = rospy.Publisher('/pc2_5', sensor_msgs.PointCloud2, latch=True);
+pc6Pub2 = rospy.Publisher('/pc2_6', sensor_msgs.PointCloud2, latch=True);
+pc7Pub2 = rospy.Publisher('/pc2_7', sensor_msgs.PointCloud2, latch=True);
+pc8Pub2 = rospy.Publisher('/pc2_8', sensor_msgs.PointCloud2, latch=True);
+pc9Pub2 = rospy.Publisher('/pc2_9', sensor_msgs.PointCloud2, latch=True);
+pcPub2 = [pc0Pub2,
+          pc1Pub2,
+          pc2Pub2,
+          pc3Pub2,
+          pc4Pub2,
+          pc5Pub2,
+          pc6Pub2,
+          pc7Pub2,
+          pc8Pub2,
+          pc9Pub2]
+
+# PoseArray publishers
+pa0Pub = rospy.Publisher('/pa0', geometry_msgs.PoseArray, latch=True);
+pa1Pub = rospy.Publisher('/pa1', geometry_msgs.PoseArray, latch=True);
+pa2Pub = rospy.Publisher('/pa2', geometry_msgs.PoseArray, latch=True);
+pa3Pub = rospy.Publisher('/pa3', geometry_msgs.PoseArray, latch=True);
+pa4Pub = rospy.Publisher('/pa4', geometry_msgs.PoseArray, latch=True);
+pa5Pub = rospy.Publisher('/pa5', geometry_msgs.PoseArray, latch=True);
+paPub = [pa0Pub,
+         pa1Pub,
+         pa2Pub,
+         pa3Pub,
+         pa4Pub,
+         pa5Pub]
+         
+
+# Marker publisher
+markerPub = rospy.Publisher('/debug_marker', visualization_msgs.Marker, latch=True);
+
+
+def grasp_task_msg(name, other=[]):
+  ''' 
+    creates the default grasp task msg 
+    other - list of other objects also in the scene (paper is included by default)     
+  '''
+  task = task_msgs.Task(); 
+  task.action = 'grasp';
+  task.action_object = name;
+  task.objects = [name, 'paper']; 
+  if other:
+    task.objects.extend(other);
+  return task;
+
+def hang_up_task_msg(door=False):
+  ''' creates the default hang_up task msg '''
+  task = task_msgs.Task(); 
+  task.action = 'hang_up';
+  task.action_object = 'phone_handset';
+  task.objects = [task.action_object, 'phone_cradle'];
+  if door:
+    task.objects.append('door');
+  return task;
+ 
+def staple_task_msg():
+  ''' creates the default staple task msg '''
+  task = task_msgs.Task(); 
+  task.action = 'staple';
+  task.action_object = 'stapler';
+  task.objects = [task.action_object, 'paper'];
+  return task;
+ 
+def trigger_task_msg(drill=False):
+  '''
+    creates the default trigger task msg 
+    'drill' if drill else 'flashlight'
+  '''
+  task = task_msgs.Task(); 
+  task.action = 'trigger';
+  task.action_object = 'right_angle_drill' if drill else 'flashlight';
+  task.objects = [task.action_object];
+  return task;
+
+def drill_task_msg():
+  '''
+    creates the default drill task msg 
+  '''
+  task = task_msgs.Task(); 
+  task.action = 'drill_hole';
+  task.action_object = 'right_angle_drill'; 
+  task.objects = [task.action_object, 'woodblock', 'red_dot'];
+  return task;
+
+def cylinder_marker(c, a, r, length=.1, color='r', markerID=0):
+  marker = visualization_msgs.Marker();
+  marker.header.frame_id = ru.BASE_FRAME;
+  marker.type = marker.CYLINDER;
+  marker.id = markerID;
+  marker.frame_locked = True;
+
+  marker.pose.position = ru.to_Point(c);
+  v = np.cross([0, 0, 1], a);
+  v /= np.linalg.norm(v);
+  th = ru.angle_between([0, 0, 1], a);
+  marker.pose.position = ru.to_Point(c);
+  marker.pose.orientation = tr.axis_angle2rosq(v, th);
+
+  marker.scale.x = 2.0*r;
+  marker.scale.y = 2.0*r;
+  marker.scale.z = length;
+  
+  (r,g,b) = ru.color2rgb(color);
+  marker.color.r = r/255.0;
+  marker.color.g = g/255.0;
+  marker.color.b = b/255.0;
+  marker.color.a = 1.0;
+  
+  return marker;
+
+def line_marker(pts, width=0.01, color='r', markerID=0):
+  marker = visualization_msgs.Marker();
+  marker.header.frame_id = ru.BASE_FRAME;
+  marker.type = marker.LINE_STRIP;
+  marker.id = markerID;
+  marker.frame_locked = True;
+
+  marker.pose = ru.to_Pose();
+
+  marker.scale.x = width;
+
+  marker.points = map(ru.to_Point, pts);
+  
+  (r,g,b) = ru.color2rgb(color);
+  marker.color.r = r/255.0;
+  marker.color.g = g/255.0;
+  marker.color.b = b/255.0;
+  marker.color.a = 1.0;
+  
+  return marker;
+
+def clear():
+  for p in pcPub:
+    pc = sensor_msgs.PointCloud()
+    pc.header.frame_id = ru.BASE_FRAME
+    pc.points = [geometry_msgs.Point32(0,0,0)]
+    p.publish(pc)
+  for p in pcPub2:
+    pc = sensor_msgs.PointCloud2()
+    pc.header.frame_id = ru.BASE_FRAME
+    p.publish(pc)
+  for p in psPub:
+    p.publish(ru.to_PoseStamped(None, None, frame_id=ru.BASE_FRAME))
+  for p in paPub:
+    pa = geometry_msgs.PoseArray()
+    pa.header.frame_id = ru.BASE_FRAME
+    p.publish(pa)
+
+
+jsPub = rospy.Publisher('/log_joint_states', sensor_msgs.JointState);
+
+pelicansBlobs = [];
+pelicansPts = [];
+pelicansPSs = [];
+jss = [];
+
+def load_pelicans():
+  global jss, pelicansBlobs, pelicansPts, pelicansPSs
+  (pelicansBlobs, jss) = pickle.load(open('pelican_flat_blobs.pkl', 'rb'));
+  pelicansPts = [ru.to_array(b.points) for b in pelicansBlobs];
+  pelicansPSs = [ru.to_PoseStamped(pcu.get_blob_pose(pts)) for pts in pelicansPts];
+
+def pelican_data(i):
+  return (copy.deepcopy(pelicansBlobs[i]), copy.deepcopy(pelicansPts[i]), copy.deepcopy(pelicansPSs[i]));
+
+def display_pelican(i):
+  blob = pelicansBlobs[i];
+  pts = pelicansPts[i];
+  ps = pelicansPSs[i];
+
+  tpts = pts[pts[:,2] > np.max(pts[:,2]) - 0.06, :]
+  mpts = pts[pts[:,2] < np.max(pts[:,2]) - 0.06, :]
+  ztpts = tpts.copy(); ztpts[:,2] = 0.0;
+  zmpts = mpts.copy(); zmpts[:,2] = 0.0;
+
+  (ztex, ztey, ztez) = pcu.get_ev(ztpts); ztez = np.cross(ztex, ztey); 
+  (zmex, zmey, zmez) = pcu.get_ev(zmpts); zmez = np.cross(zmex, zmey); 
+  ztPS = ru.to_PoseStamped(np.dot(tr.trans(np.mean(ztpts,axis=0)), tr.ev2rot((ztex, ztey, ztez))));
+  zmPS = ru.to_PoseStamped(np.dot(tr.trans(np.mean(zmpts,axis=0)), tr.ev2rot((zmex, zmey, zmez))));
+
+  pc0Pub.publish(ru.to_PointCloud(pts)); 
+  ps0Pub.publish(ps);
+
+  pc1Pub.publish(ru.to_PointCloud(tpts));
+  pc2Pub.publish(ru.to_PointCloud(mpts));
+
+  pc3Pub.publish(ru.to_PointCloud(ztpts));
+  pc4Pub.publish(ru.to_PointCloud(zmpts));
+  ps3Pub.publish(ztPS);
+  ps4Pub.publish(zmPS);
+
+

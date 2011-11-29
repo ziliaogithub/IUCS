@@ -1,0 +1,381 @@
+import time
+import math
+import sys
+import copy
+import string 
+import numpy as np
+import scipy as sp
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+
+import std_msgs.msg as std_msgs
+import geometry_msgs.msg as geometry_msgs
+import sensor_msgs.msg as sensor_msgs
+
+import pr_msgs.msg as pr_msgs
+import pr_msgs.srv as pr_srvs
+
+import HandControl_msgs.msg as HandControl_msgs 
+import level_fingertip_msgs.srv as lfg
+
+import RosUtil as ru
+from polling_action_client import PollingActionClient as PAC
+
+import Arm
+
+HAND_DOF = 4;
+BHANDMODE_IDLE = 2;
+BHANDMODE_POSITION_TRPZ = 3;
+BHANDMODE_VELOCITY = 4;
+
+PYRAMID_POSITIONS = np.array(np.deg2rad([100, 100, 100, 0]));
+
+CLOSE_DIR = +1;
+
+velFilterWeight = 0.1;
+tPositions = rospy.Time().to_sec();
+
+positions = np.zeros(HAND_DOF);
+secondaryPositions = np.zeros(HAND_DOF-1);
+velocities = np.zeros(HAND_DOF);
+secondaryVelocities = np.zeros(HAND_DOF-1);
+strain = np.zeros(HAND_DOF-1);
+state = 0;
+prev_traj_state = pr_msgs.TrajInfo.state_done;
+
+# service clients
+ResetHand = ru.service_proxy('/bhd/ResetHandQuick', pr_srvs.ResetHand, not ru.is_sim());
+ResetFinger = ru.service_proxy('/bhd/ResetFinger', pr_srvs.ResetFinger, not ru.is_sim());
+LevelFingertipGrasp = ru.service_proxy('/owd/LevelFingertipGrasp', lfg.LevelFingertipGrasp, not ru.is_sim());
+SetProperty = ru.service_proxy('/bhd/SetProperty', pr_srvs.SetHandProperty, not ru.is_sim());
+
+## subscriber callbacks
+
+def HandStateCallback(data):
+  global positions;
+  global secondaryPositions;
+  global velocities;
+  global secondaryVelocities;
+  global strainGauge;
+  global tPositions;
+  global state;
+
+  dt = data.header.stamp.to_sec() - tPositions;
+  
+  if dt > 0: 
+    tPositions = data.header.stamp.to_sec();
+
+    velocities[:] = velFilterWeight * velocities + (1-velFilterWeight) * ((data.positions - positions)/dt);
+  # TODO: enable secondaryVelocities when the hand is fixed
+  #secondaryVelocities[:] = velFilterWeight * secondaryVelocities + (1-velFilterWeight) * ((data.secondary_positions - secondaryPositions)/dt);
+
+    positions[:] = data.positions;
+    secondaryPositions[:] = positions[:3]/2.0;
+
+    strain[:] = data.strain;
+    state = data.state;
+
+## setup subscribers
+rospy.logdebug(__name__ + ': setting up subscribers...');
+# owd
+rospy.Subscriber('/bhd/handstate', pr_msgs.BHState, HandStateCallback, None, 1)
+
+## setup services
+rospy.logdebug(__name__ + ': setting up service connections...')
+MoveHand = ru.service_proxy('/bhd/MoveHand', pr_srvs.MoveHand, not ru.is_sim());
+RelaxHand = ru.service_proxy('/bhd/RelaxHand', pr_srvs.RelaxHand, not ru.is_sim());
+SetSpeed = ru.service_proxy('/bhd/SetSpeed', pr_srvs.SetSpeed, not ru.is_sim());
+
+## actionlib connections
+rospy.logdebug(__name__ + ': setting up actionlib connections...');
+# HandControl
+#handControl = ru.actionlib_proxy('hand_control', HandControl_msgs.HandControlAction, not ru.is_sim());
+handControl = PAC.PollingActionClient('hand_control', HandControl_msgs.HandControlAction, wait_for_server=False);
+
+def set_mode(mode):
+  ''' sets the hand mode '''
+  rospy.logwarn('Hand: set_mode is deprecated.');
+  pass;
+
+def set_pos(pos=np.array([0.0, 0.0, 0.0, 0.0]), wait=False, thres=0.05, timeout=5.0):
+  ''' moves the fingers to the desired positions '''
+  global MoveHand;
+
+  req = pr_srvs.MoveHandRequest();
+  req.movetype = req.movetype_position;
+  req.positions = pos;
+
+  try:
+    resp = MoveHand(req);
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': MoveHand service request failed: %s' % err);
+    return False;
+
+  if not resp.ok:
+    rospy.logwarn(__name__ + '.set_pos: MoveHand not ok: %s' % (resp.reason));
+    return resp.ok;
+  
+  t0 = rospy.Time().now().to_sec();
+  while np.any(np.abs(positions - np.array(pos)) > thres):
+    if rospy.Time().now().to_sec() - t0 > timeout:
+      rospy.logwarn(__name__ + '.set_pos: timeout on move');
+      break;
+    rospy.sleep(0.05);
+    
+  return True;
+  
+  
+
+def set_speed(vel):
+  global SetSpeed;
+
+  # format arguments if needed
+  if (hasattr(vel, '__iter__')):
+    if (len(vel) != HAND_DOF):
+      rospy.logerr(__name__ + '.set_speed: vel argument does not have correct length (%d != %d)' % (len(vel), HAND_DOF));
+      return False;
+  else:
+    vel = [vel]*HAND_DOF;
+  
+  rospy.logdebug('Hand: set speed to: ' + str(vel));
+  
+  try:
+    SetSpeed(velocities = vel);
+  except rospy.ServiceException as err:
+    rospy.logwarn('Hand: SetSpeed service request failed: %s' % err);
+
+def set_hsg(value=9999):
+  global SetProperty
+  try:
+    SetProperty(nodeid=11, property=71, value=value)
+    SetProperty(nodeid=12, property=71, value=value)
+    SetProperty(nodeid=13, property=71, value=value)
+  except rospy.ServiceException as err:
+    rospy.logwarn('Hand: SetProperty service request failed: %s' % err);
+
+def set_vel(vel=np.array([0, 0, 0, 0])):
+  ''' sets the fingers to the given vel '''
+  global MoveHand;
+
+  req = pr_srvs.MoveHandRequest();
+  req.movetype = req.movetype_velocity;
+  req.positions = vel;
+
+  try:
+    resp = MoveHand(req);
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': MoveHand service request failed: %s' % err);
+    return False;
+
+  if not resp.ok:
+    rospy.logwarn(__name__ + '.set_vel: MoveHand not ok: %s' % (resp.reason));
+  
+  return resp.ok;
+    
+
+def reset(fingers=[True]*HAND_DOF):
+  '''
+    open the hand and reset breakaway joints
+    fingers: boolean array indicating which fingers to reset (also supports fingers=fingerID)
+    
+    reset([True, False, False]) - reset finger 1
+    reset(1) - reset finger 1
+  '''
+  # if the input is just the finger id, create the array
+  if (type(fingers) == int or type(fingers) == float):
+    # owd uses 1 indexed fingers
+    fid = int(fingers) - 1;
+    fingers = [False]*HAND_DOF;
+    fingers[fid] = True;
+
+  success = True;
+  if np.all(fingers):
+    rospy.loginfo(__name__ + ': resetting hand to clear breakaways'); 
+    try:
+      resp = ResetHand();
+
+      if not resp.ok:
+        rospy.logerr(__name__ + ' ResetHand not ok: %s' % resp.reason);
+        success = False;
+    except rospy.ServiceException as err:
+      rospy.logerr(__name__ + ' ResetHand service request failed: %s' % err);
+      success = False;
+
+  else:
+    # owd uses 1 indexed fingers 
+    fingerIds = np.nonzero(fingers)[0] + 1;
+    for i in fingerIds: 
+      rospy.loginfo(__name__ + ': resetting finger %d to clear breakaway' % i); 
+      try:
+        resp = ResetFinger(i);
+
+        if not resp.ok:
+          rospy.logerr(__name__ + ' ResetFinger (%d) not ok: %s' % (i, resp.reason));
+          success = False;
+
+      except rospy.ServiceException as err:
+        rospy.logerr(__name__ + ' ResetFinger (%d) service request failed: %s' % (i, err));
+        success = False;
+
+  return success;
+
+
+
+def open(vel=np.array([1.0, 1.0, 1.0, 0.0])):
+  ''' open the fingers with a given velocity '''
+  nvel = np.array(vel);
+  nvel[:3] = -CLOSE_DIR * np.abs(vel[:3]);
+
+  set_vel(nvel)
+
+  
+def close(vel=np.array([1.0, 1.0, 1.0, 0.0])):
+  ''' close the fingers with given velocities '''
+  nvel = np.array(vel);
+  nvel[:3] = CLOSE_DIR * np.abs(vel[:3]);
+
+  set_vel(nvel)
+
+
+def close_until(vel=np.array([1.0, 1.0, 1.0, 0]), 
+                timeout=5.0, 
+                preempt_requested_fcn=None,
+                block=True,
+                holdingTorque=0):
+  ''' close the fingers until the conditions are met '''
+  return hand_control('close', vel[0], timeout, preempt_requested_fcn, block, holdingTorque);
+
+def close_to(angles=[2.4, 2.4, 2.4, 0],
+             vel=1.0,
+             timeout=10.0, 
+             preempt_requested_fcn=None,
+             block=True,
+             holdingTorque=0):
+  ''' close the fingers to the specified angles '''
+  return hand_control('angles', vel, timeout, preempt_requested_fcn, block, holdingTorque, angles);
+
+
+def zero(vel=np.array([1.0, 1.0, 1.0, 0.0]), 
+         timeout=5.0, 
+         preempt_requested_fcn=None,
+         block=True,
+         holdingTorque=0):
+  ''' moves the fingers to the zero position (open) '''
+  return hand_control('open', vel[0], timeout, preempt_requested_fcn, block, holdingTorque);
+
+
+def fist(vel=np.array([1.0, 1.0, 1.0, 0]), 
+         timeout=5.0, 
+         preempt_requested_fcn=None,
+         block=True,
+         holdingTorque=0):
+  ''' moves the fingers into the fist posisition (closed) '''
+  return hand_control('close', vel=vel[0], timeout=timeout, preempt_requested_fcn=preempt_requested_fcn, block=block, holdingTorque=holdingTorque);
+
+
+def stop():
+  ''' stop the fingers '''
+  global RelaxHand;
+
+  try:
+    resp = RelaxHand();
+  except rospy.ServiceException as err:
+    rospy.logerr(__name__ + ': RelaxHand service request failed: %s' % err);
+    return False;
+
+  if not resp.ok:
+    rospy.logwarn(__name__ + '.stop: RelaxHand not ok: %s' % (resp.reason));
+  
+  return resp.ok;
+    
+
+def hand_control(action, vel=1.0, timeout=10.0, preempt_requested_fcn=None, block=True, holdingTorque=0, angles=None):
+  global handControl 
+  action = string.lower(action);
+  
+  goal = HandControl_msgs.HandControlGoal();
+  goal.speed = vel;
+  goal.holdingTorque = holdingTorque;
+  if action == 'close':
+    goal.command = HandControl_msgs.HandControlGoal.CLOSE;
+  elif action == 'open':
+    goal.command = HandControl_msgs.HandControlGoal.OPEN;
+  elif action == 'angles' and angles != None:
+    goal.command = HandControl_msgs.HandControlGoal.SET_ANGLES;
+    goal.angles.bhandInnerLinkPositions = angles[:3]
+    goal.angles.bhandSpreadAngle = angles[3]
+  else:
+    goal.command = HandControl_msgs.HandControlGoal.SET_ANGLES;
+    goal.configuration = action;
+
+  try:
+    handControl.request(goal);
+    if block == False:
+      return 0
+    (success, result) = handControl.wait_for_result(max_seconds = timeout,
+                                                    stop_condition_lambda = preempt_requested_fcn);
+    if not success:
+      rospy.logwarn('Hand: HandControl action failed');
+      return 1
+  except Exception as e:
+    rospy.logerr(__name__ + ': HandControl action failed: %s' % str(e));
+    return 1
+  return 0
+
+
+def level_fingertip_grasp(goalFingerPosition=0, fingerVelocity=0, palmOffset=0, 
+                          wait=True, preempt_requested_fcn=None, short_circuit_fcn=None):
+  global LevelFingertipGrasp
+  
+  try:
+    resp = LevelFingertipGrasp(goalFingerPosition=goalFingerPosition,
+                               fingerVelocity=fingerVelocity,
+                               palmOffset=palmOffset);
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': LevelFingertipGrasp service request failed:\t%s' % str(e));
+    return 1;
+
+  if (not resp.ok):
+    rospy.logwarn(__name__ + ': LevelFingertipGrasp: %s' % resp.reason);
+    return 1;
+
+  rospy.loginfo(__name__ + ': level_fingertip_grasp said: %s' % str(resp));
+  
+  # wait for it to finish the grasp
+  if wait:
+    t0 = rospy.Time().now().to_sec();
+    while (Arm.state != pr_msgs.WAMState.state_traj_active and
+           Arm.state != pr_msgs.WAMState.state_traj_stalled):
+      rospy.sleep(0.01)
+      if rospy.Time().now().to_sec() - t0 > 1.0:
+        break;
+
+    t1 = rospy.Time().now().to_sec();
+    # print 'waited for arm state to change from %f to %f ' % (t0, t1)
+    while (Arm.state == pr_msgs.WAMState.state_traj_active or 
+           Arm.state == pr_msgs.WAMState.state_traj_stalled):
+      
+      dt = rospy.Time().now().to_sec() - t0; 
+
+      if (preempt_requested_fcn and preempt_requested_fcn()):
+        return -1;
+
+      if (short_circuit_fcn and short_circuit_fcn()):
+        return -2;
+
+      # TODO: timeout?
+      #if (dt > moveTimeout):
+      #  rospy.logwarn(__name__ + ': timeout on move after %0.3f sec' % (dt));
+      #  break;
+    
+    # look at trajectory state to determine if trajectory was aborted
+    # return a different error code if aborted
+    if (Arm.prev_traj_state == pr_msgs.TrajInfo.state_aborted):
+      return 2;    
+
+  return 0;
+
+def cleanup():
+  ''' this is designed to be called for preempts '''
+  stop(); 

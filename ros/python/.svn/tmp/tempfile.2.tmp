@@ -1,0 +1,244 @@
+import time
+import math
+import copy 
+import numpy as np
+import scipy as sp 
+
+import roslib; roslib.load_manifest('scripting_util')
+import rospy
+import message_filters
+
+import std_msgs.msg as std_msgs
+import geometry_msgs.msg as geometry_msgs
+import sensor_msgs.msg as sensor_msgs
+
+import Bumblebee2_msgs.msg as Bumblebee2_msgs
+import Bumblebee2_msgs.srv as Bumblebee2_srvs
+
+import Perception_msgs_upenn.msg as Perception_msgs
+import Perception_msgs_upenn.srv as Perception_srvs
+
+import RosUtil as ru
+import threading
+
+POINTS_TOPIC  = '/BB2/filtered/points';
+POINTS2_TOPIC = '/BB2/filtered/points2';
+
+stereoColorLock = threading.Lock();
+stereoMonoLock = threading.Lock();
+stereoInfoLock = threading.Lock();
+
+properties = Bumblebee2_msgs.CamProperties();
+info = Bumblebee2_msgs.CamInfo();
+left = sensor_msgs.Image();
+right = sensor_msgs.Image();
+leftMono = sensor_msgs.Image();
+rightMono = sensor_msgs.Image();
+leftInfo = sensor_msgs.CameraInfo();
+rightInfo = sensor_msgs.CameraInfo();
+
+paperCandidates = [];
+paperStamp = 0.0;
+
+def Bumblebee2PropertiesCallback(data):
+  global properties
+  properties = data;
+
+def Bumblebee2InfoCallback(data):
+  global info 
+  info = data;
+
+def Bumblebee2ImageSyncCallback(l, r):
+  global left
+  global right 
+  with stereoColorLock:
+    left = l;
+    right = r;
+
+def Bumblebee2ImageInfoSyncCallback(linfo, rinfo):
+  global leftInfo
+  global rightInfo
+  with stereoInfoLock:
+    leftInfo = linfo;
+    rightInfo = rinfo;
+
+def Bumblebee2ImageMonoSyncCallback(l, r):
+  global leftMono
+  global rightMono
+  with stereoMonoLock:
+    leftMono = l;
+    rightMono = r;
+
+def PaperCandidatesCallback(data):
+  global paperCandidates, paperStamp
+  paperStamp = rospy.Time().now().to_sec();
+  paperCandidates = data.candidates;
+
+
+## setup ros subscribers
+rospy.logdebug(__name__ + ': setting up subscribers...');
+# re2
+rospy.Subscriber('/BB2/cam_properties', Bumblebee2_msgs.CamProperties, Bumblebee2PropertiesCallback, None, 1)
+rospy.Subscriber('/BB2/cam_info', Bumblebee2_msgs.CamInfo, Bumblebee2InfoCallback, None, 1)
+leftSub = message_filters.Subscriber('/BB2/left/image_rect_color', sensor_msgs.Image)
+rightSub = message_filters.Subscriber('/BB2/right/image_rect_color', sensor_msgs.Image)
+imageSync = message_filters.TimeSynchronizer([leftSub, rightSub], 1)
+imageSync.registerCallback(Bumblebee2ImageSyncCallback);
+leftMonoSub = message_filters.Subscriber('/BB2/left/image_rect', sensor_msgs.Image)
+rightMonoSub = message_filters.Subscriber('/BB2/right/image_rect', sensor_msgs.Image)
+imageMonoSync = message_filters.TimeSynchronizer([leftMonoSub, rightMonoSub], 1)
+imageMonoSync.registerCallback(Bumblebee2ImageMonoSyncCallback);
+leftInfoSub = message_filters.Subscriber('/BB2/left/camera_info', sensor_msgs.CameraInfo)
+rightInfoSub = message_filters.Subscriber('/BB2/right/camera_info', sensor_msgs.CameraInfo)
+imageInfoSync = message_filters.TimeSynchronizer([leftInfoSub, rightInfoSub], 1)
+imageInfoSync.registerCallback(Bumblebee2ImageInfoSyncCallback);
+# upenn
+rospy.Subscriber('/BB2/paper_candidate_centroid', Perception_msgs.PaperCandidates, PaperCandidatesCallback, None, 1);
+
+
+## setup publishers
+rospy.logdebug(__name__ + ': setting up publishers...');
+# upenn
+shutterPub = rospy.Publisher('/BB2/shutter', Perception_msgs.ShutterStamped);
+shutterBlobPub = rospy.Publisher('/BB2/blob_shutter', Perception_msgs.ShutterStamped);
+
+## setup services
+rospy.logdebug(__name__ + ': setting up service connections...')
+# re2 
+setBrightnessService = ru.service_proxy('/BB2/set_brightness', Bumblebee2_srvs.SetBrightness, not ru.is_sim());
+setConfigFileService = ru.service_proxy('/BB2/set_config_file', Bumblebee2_srvs.SetConfigFile, not ru.is_sim());
+setExposureService = ru.service_proxy('/BB2/set_exposure', Bumblebee2_srvs.SetExposure, not ru.is_sim());
+setFrameRateService = ru.service_proxy('/BB2/set_frame_rate', Bumblebee2_srvs.SetFrameRate, not ru.is_sim());
+setGainService = ru.service_proxy('/BB2/set_gain', Bumblebee2_srvs.SetGain, not ru.is_sim());
+setShutterService = ru.service_proxy('/BB2/set_shutter', Bumblebee2_srvs.SetShutter, not ru.is_sim());
+setWhiteBalanceService = ru.service_proxy('/BB2/set_white_balance', Bumblebee2_srvs.SetWhiteBalance, not ru.is_sim());
+# upenn
+tabletopBlobDetector = ru.service_proxy('/BB2/tabletop_blob_detector', Perception_srvs.TabletopBlobDetector, not ru.is_sim());
+
+
+def set_brightness(value):
+  try:
+    resp = setBrightnessService(value);
+    rospy.loginfo(__name__ + ': set brightness to %0.3f' % resp.value);
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': SetBrightness service request failed:\t%s' % str(e));
+
+def set_config_file(filename):
+  try:
+    resp = setConfigFileService(filename);
+    rospy.loginfo(__name__ + ': set config file to %s' % resp.filename);
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': SetConfigFile service request failed:\t%s' % str(e));
+
+def set_exposure(value, autoSet=False, manualPush=False):
+  try:
+    resp = setExposureService(value, autoSet, manualPush);
+    rospy.loginfo(__name__ + ': set exposure value=%0.3f autoSet=%s manualPush=%s' % (resp.value, resp.autoSet, resp.manualPush));
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': SetExposure service request failed:\t%s' % str(e));
+
+def set_frame_rate(value, autoSet=False):
+  try:
+    resp = setFrameRateService(value, autoSet);
+    rospy.loginfo(__name__ + ': set frame rate value=%0.3f autoSet=%s' % (resp.value, resp.autoSet));
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': SetFrameRate service request failed:\t%s' % str(e));
+
+def set_gain(value, autoSet=False, manualPush=False):
+  try:
+    resp = setGainService(value, autoSet, manualPush);
+    rospy.loginfo(__name__ + ': set gain value=%0.3f autoSet=%s manualPush=%s' % (resp.value, resp.autoSet, resp.manualPush));
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': SetGain service request failed:\t%s' % str(e));
+
+def set_shutter(value, autoSet=False, manualPush=False):
+  try:
+    resp = setShutterService(value, autoSet, manualPush);
+    rospy.loginfo(__name__ + ': set shutter value=%0.3f autoSet=%s manualPush=%s' % (resp.value, resp.autoSet, resp.manualPush));
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': SetShutter service request failed:\t%s' % str(e));
+
+def set_white_balance(redValue, blueValue, autoSet=False, manualPush=False):
+  try:
+    resp = setWhiteBalanceService(redValue, blueValue, autoSet, manualPush);
+    rospy.loginfo(__name__ + ': set white balance redValue=%0.3f blueValue=%0.3f autoSet=%s manualPush=%s' % (resp.redValue, resp.blueValue, resp.autoSet, resp.manualPush));
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': SetWhiteBalance service request failed:\t%s' % str(e));
+
+def all_auto():
+  global properties
+  set_exposure(properties.exposure, autoSet=True);
+  set_frame_rate(properties.frameRate, autoSet=True);
+  set_gain(properties.gain, autoSet=True); 
+  set_shutter(properties.shutter, autoSet=True);
+  set_white_balance(properties.whiteBalanceRed, properties.whiteBalanceBlue, autoSet=True);
+
+def auto_off():
+  global properties
+  set_exposure(properties.exposure, autoSet=False);
+  set_frame_rate(properties.frameRate, autoSet=False);
+  set_gain(properties.gain, autoSet=False); 
+  set_shutter(properties.shutter, autoSet=False);
+  set_white_balance(properties.whiteBalanceRed, properties.whiteBalanceBlue, autoSet=False);
+
+
+def shutter(wait=True):
+  ''' shutters Bumblebee2 images '''
+  global left
+  t0 = rospy.Time().now();
+  shutterPub.publish(Perception_msgs.ShutterStamped(rospy.Header(0, t0, '/baseLink')));
+  shutterBlobPub.publish(Perception_msgs.ShutterStamped(rospy.Header(0, t0, '/baseLink')));
+  while (wait and t0 > left.header.stamp and 0.2 > rospy.Time().now().to_sec() - t0.to_sec()):
+    rospy.sleep(.001);
+
+  return (left.header.stamp.to_sec() >= t0.to_sec());
+
+
+def get_points():
+  ''' returns the filtered disparity point cloud '''
+  return rospy.wait_for_message(POINTS_TOPIC, sensor_msgs.PointCloud);
+
+
+def get_points2():
+  ''' returns the filtered disparity point cloud 2 '''
+  return rospy.wait_for_message(POINTS2_TOPIC, sensor_msgs.PointCloud2);
+
+
+def get_stereo_color():
+  global left
+  global right
+  with stereoColorLock:
+    return (copy.deepcopy(left), copy.deepcopy(right));
+
+def get_stereo_mono():
+  global leftMono
+  global rightMono
+  with stereoMonoLock:
+    return (copy.deepcopy(leftMono), copy.deepcopy(rightMono));
+
+def get_stereo_info():
+  global leftInfo
+  global rightInfo
+  with stereoInfoLock:
+    return (copy.deepcopy(leftInfo), copy.deepcopy(rightInfo));
+
+def shutter_paper():
+  ''' shutters Bumblebee2 image to trigger paper detector '''
+  global left
+  t0 = rospy.Time().now();
+  shutterPub.publish(Perception_msgs.ShutterStamped(rospy.Header(0, t0, '/baseLink')));
+
+def shutter_blob():
+  ''' shutters Bumblebee2 image to trigger blob detector '''
+  global left
+  t0 = rospy.Time().now();
+  shutterBlobPub.publish(Perception_msgs.ShutterStamped(rospy.Header(0, t0, '/baseLink')));
+
+def tabletop_blob():
+  try:
+    resp = tabletopBlobDetector();
+  except rospy.ServiceException, e:
+    rospy.logerr(__name__ + ': TabletopBlobDetector service request failed:\t%s' % str(e));
+    return Perception_srvs.TabletopBlobDetectorResponse().blobs_stamped;
+  
+  return resp.blobs_stamped;
