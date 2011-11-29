@@ -1,0 +1,3 @@
+This directory contains a number of matlab functions to interact with ros
+services and parameters through matlab. It is purely meant for quick testing
+purposes as it is uses the command line tools and is fairly slow. 
